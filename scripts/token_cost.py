@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import token_cost_db as T          # append-only база: runs / usage_snapshot / increments
 
-CHAT_ID = "362122320"
+CHAT_ID = os.environ.get("TOKEN_COST_CHAT_ID") or "362122320"
 DB = os.path.expanduser("~/.hermes/state.db")
 SNAP = os.path.expanduser("~/.hermes/state/token_cost_snapshots.json")
 LEDGER = os.path.expanduser("~/.hermes/state/token_cost_ledger.json")
@@ -47,18 +47,21 @@ def conn():
 
 
 def resolve_session(c):
+    """Сессия для блока «За текущую сессию». Возвращает (session_id, найдена через
+    routing) — если routing-записи нет, это чужой чат или другой профиль: в отчёте
+    это называется, а не выдаётся за факт."""
     row = c.execute("SELECT entry_json FROM gateway_routing WHERE session_key=?",
                     (f"agent:main:telegram:dm:{CHAT_ID}",)).fetchone()
     if row:
         try:
             sid = json.loads(row[0]).get("session_id")
             if sid:
-                return sid
+                return sid, True
         except Exception:
             pass
     r = c.execute("SELECT id FROM sessions WHERE chat_id=? ORDER BY started_at DESC LIMIT 1",
                   (CHAT_ID,)).fetchone()
-    return r[0] if r else None
+    return (r[0] if r else None), False
 
 
 def totals(c, sid=None):
@@ -73,10 +76,30 @@ def totals(c, sid=None):
 
 
 def zai_total(c):
-    """Сколько токенов ушло на z.ai — в отчёт не входят, но показать стоит."""
-    q = ("SELECT COALESCE(SUM(input_tokens+cache_read_tokens+output_tokens),0) "
-         f"FROM session_model_usage WHERE {ZAI_WHERE}")
-    return c.execute(q).fetchone()[0]
+    """Сколько токенов ушло на z.ai — в отчёт не входят, но показать стоит.
+    Возвращает (всего, оплаченные): оплаченные — это НЕ coding plan, по ним
+    реально списаны деньги, и называть их «подпиской» нельзя."""
+    q = ("SELECT COALESCE(SUM(input_tokens+cache_read_tokens+output_tokens),0), "
+         "COALESCE(SUM(CASE WHEN actual_cost_usd > 0 THEN input_tokens+cache_read_tokens+output_tokens "
+         "ELSE 0 END),0) FROM session_model_usage WHERE " + ZAI_WHERE)
+    return c.execute(q).fetchone()
+
+
+def resolve_profile():
+    """Профиль запуска. Cron НЕ устанавливает HERMES_PROFILE (его ставит только
+    kanban-диспетчер), поэтому профиль берём из записи задачи в jobs.json —
+    cron наследует профиль создателя, и на мультипрофильной машине это важно."""
+    job = os.environ.get("TOKEN_COST_CRON_JOB")
+    if job:
+        try:
+            d = json.load(open(os.path.expanduser("~/.hermes/cron/jobs.json")))
+            jobs = d if isinstance(d, list) else (d.get("jobs") or [])
+            for j in jobs:
+                if isinstance(j, dict) and j.get("name") == job:
+                    return j.get("profile") or os.environ.get("HERMES_PROFILE") or "default"
+        except Exception:
+            pass
+    return os.environ.get("HERMES_PROFILE") or "default"
 
 
 def bump_ledger(cur):
@@ -86,16 +109,22 @@ def bump_ledger(cur):
     d = {}
     if os.path.exists(LEDGER):
         try:
-            d = json.load(open(LEDGER))
+            with open(LEDGER) as f:
+                d = json.load(f)
         except Exception:
             d = {}
     last = [int(d.get("last_seen", {}).get(k, 0) or 0) for k in KEYS]
     cum = [int(d.get("cumulative", {}).get(k, 0) or 0) for k in KEYS]
     cum = [cum[i] + max(0, cur[i] - last[i]) for i in range(3)]
-    json.dump({"last_seen": dict(zip(KEYS, cur)),
-               "cumulative": dict(zip(KEYS, cum)),
-               "updated_at": datetime.now(timezone.utc).isoformat()},
-              open(LEDGER, "w"), ensure_ascii=False)
+    # fresh-установка: каталога state/ может ещё не быть — без makedirs первый
+    # запуск падает с FileNotFoundError и отчёт не формируется вообще
+    os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+    with open(LEDGER, "w") as f:
+        json.dump({"last_seen": dict(zip(KEYS, cur)),
+                   "cumulative": dict(zip(KEYS, cum)),
+                   "fresh_install": not d,
+                   "updated_at": datetime.now(timezone.utc).isoformat()},
+                  f, ensure_ascii=False)
     return cum, not d
 
 
@@ -109,13 +138,8 @@ def parse_price(cell):
     return float(m.group(1)) if m else None
 
 
-def fetch_prices():
+def parse_price_table(html):
     """Строка таблицы цен z.ai для GLM-5.3-Flash; колонки определяем по заголовку таблицы."""
-    try:
-        req = urllib.request.Request(URL, headers={"User-Agent": UA})
-        html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
-    except Exception:
-        return None, "сайт не ответил"
     for table in re.findall(r"<table[^>]*>.*?</table>", html, re.S):
         header = [re.sub(r"<[^>]+>", "", c).strip() for c in re.findall(r"<th[^>]*>(.*?)</th>", table, re.S)]
         if "Input" not in header or "Output" not in header or "Cached Input" not in header:
@@ -133,6 +157,15 @@ def fetch_prices():
     return None, "модель не найдена на странице"
 
 
+def fetch_prices():
+    try:
+        req = urllib.request.Request(URL, headers={"User-Agent": UA})
+        html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
+    except Exception:
+        return None, "сайт не ответил"
+    return parse_price_table(html)
+
+
 def load_cache():
     try:
         d = json.load(open(PRICE_CACHE))
@@ -140,6 +173,19 @@ def load_cache():
         return {k: float(v) for k, v in d.items() if k in pk} or None
     except Exception:
         return None
+
+
+# курс ищем только рядом со словом «курс» — иначе можно схватить цену самой карты;
+# обязательное условие — дробное число (цена карты «2 990₽» дроби не имеет и не пройдёт)
+RATE_PAT = re.compile(r"курс[^\d]{0,20}(\d+[.,]\d{1,2})\s*(?:₽|руб)?")
+
+
+def fetch_rate_from_text(text):
+    for m in re.finditer(re.escape(TARIFF), text):
+        hit = RATE_PAT.search(text[m.start():m.start() + 300])
+        if hit:
+            return float(hit.group(1).replace(",", "."))
+    return None
 
 
 def fetch_rate():
@@ -150,12 +196,9 @@ def fetch_rate():
     except Exception:
         return None, "сайт не ответил"
     text = re.sub(r"<[^>]+>", " ", html)
-    # курс ищем только рядом со словом «курс» — иначе можно схватить цену самой карты
-    pat = re.compile(r"курс[^\d]{0,20}(\d+[.,]\d{1,2})\s*(?:₽|руб)")
-    for m in re.finditer(re.escape(TARIFF), text):
-        hit = pat.search(text[m.start():m.start() + 300])
-        if hit:
-            return float(hit.group(1).replace(",", ".")), None
+    rate = fetch_rate_from_text(text)
+    if rate:
+        return rate, None
     return None, f"курс тарифа «{TARIFF}» не найден на странице"
 
 
@@ -220,7 +263,7 @@ def main():
     commit = "--commit" in sys.argv          # только автоматический запуск по расписанию
     tick = "--tick" in sys.argv              # фоновый тик: обновить копилку и молчать
     c = conn()
-    sid = resolve_session(c)
+    sid, via_routing = resolve_session(c)
 
     cur_all = totals(c)                       # локальные токены по всем сессиям
     if dry:
@@ -230,16 +273,20 @@ def main():
         cumulative, ledger_fresh = bump_ledger(cur_all)
 
     if tick:
-        # тик: без сети, значения из кэша; запись в базу и пустой stdout (тихо)
-        con_db = T.connect()
-        T.record_run(con_db, "tick", os.environ.get("TOKEN_COST_CRON_JOB"),
-                     os.environ.get("HERMES_PROFILE") or "default", sid,
-                     load_cache() or DEFAULTS, load_rate_cache() or DEFAULT_RATE,
-                     "cache", cumulative, None)
+        # тик: без сети, значения из кэша; запись в базу и пустой stdout (тихо).
+        # Ошибка записи не должна ронять крон-задачу — тик молчит и выходит.
+        try:
+            con_db = T.connect()
+            T.record_run(con_db, "tick", os.environ.get("TOKEN_COST_CRON_JOB"),
+                         resolve_profile(), sid,
+                         load_cache() or DEFAULTS, load_rate_cache() or DEFAULT_RATE,
+                         "cache", cumulative, None)
+        except Exception:
+            pass
         return
 
     cur_sess = totals(c, sid) if sid else (0, 0, 0)
-    zai = zai_total(c)
+    zai, zai_paid = zai_total(c)
     row = c.execute("SELECT model, started_at FROM sessions WHERE id=?",
                     (sid,)).fetchone() if sid else None
     started = row[1] if row else None
@@ -294,53 +341,79 @@ def main():
 
     # --- база (append-only): каждое значение каждого запуска + таймстамп + провайдер/модель ---
     con_db = None
+    db_note = None
     if dry:
         if os.path.exists(T.DB):
-            con_db = sqlite3.connect(f"file:{T.DB}?mode=ro", uri=True, timeout=10)
+            try:
+                con_db = sqlite3.connect(f"file:{T.DB}?mode=ro", uri=True, timeout=10)
+            except Exception as e:
+                db_note = f"База есть, но открыть её не удалось ({e}) — сутки посчитаны старым путём."
     else:
-        con_db = T.connect()
-        T.record_run(con_db, "tick" if tick else ("commit" if commit else "manual"),
-                     os.environ.get("TOKEN_COST_CRON_JOB"),
-                     os.environ.get("HERMES_PROFILE") or "default",
-                     sid, p, rate, rate_source, cumulative, started)
+        try:
+            con_db = T.connect()
+            T.record_run(con_db, "tick" if tick else ("commit" if commit else "manual"),
+                         os.environ.get("TOKEN_COST_CRON_JOB"),
+                         resolve_profile(),
+                         sid, p, rate, rate_source, cumulative, started)
+        except Exception as e:
+            # locked / битая база / любая ошибка записи — отчёт должен выйти и без базы
+            con_db = None
+            db_note = f"База недоступна ({e}) — сутки посчитаны дельтой от снимка 21:00 (старый путь)."
 
     now = time.time()
-    db_note = None
+    prev_commit = None
     if con_db is not None:
         day = T.window_sum(con_db, "local", now - 86400, now)
-        prev = con_db.execute("SELECT run_epoch FROM runs WHERE job='commit' ORDER BY run_epoch DESC LIMIT 1").fetchone()
-        prev_commit = prev[0] if prev else None
+        prow = con_db.execute("SELECT run_epoch FROM runs WHERE job='commit' ORDER BY run_epoch DESC LIMIT 1").fetchone()
+        prev_commit = prow[0] if prow else None
         since_commit = T.window_sum(con_db, "local", prev_commit, now) if prev_commit else day
         if prev_commit:
             hours = (now - prev_commit) / 3600
         else:
-            db_note = ("База ещё не имеет запуска 21:00 — среднее за час считается от полуночи, "
-                       "а суточное окно — только по строкам, записанным в базу.")
             lt = time.localtime()
             hours = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) / 3600
-        db_note = ((db_note + " ") if db_note else "") + (
-            "Суточное окно = сумма инкрементов по временным окнам из базы (append-only, ничего не удаляется); "
-            "строки, существовавшие до создания базы, атрибутированы точкой last_seen — это оценка.")
+        notes = []
+        if T.db_start(con_db) >= now - 60:
+            notes.append("База создана этим запуском: суточное окно и «по дням» — только по строкам, "
+                         "записанным сейчас (backfill, оценка по last_seen).")
+        if not prev_commit:
+            notes.append("Запусков 21:00 в базе ещё нет — строка «с 21:00» показывает то же суточное окно, "
+                         "среднее за час считается от полуночи.")
+        notes.append("Суточное окно = сумма инкрементов по временным окнам из базы (append-only, "
+                     "ничего не удаляется).")
+        n_anom = con_db.execute("SELECT COUNT(*) FROM increments WHERE attribution='anomaly'").fetchone()[0]
+        if n_anom:
+            notes.append(f"Anomaly-строки: {n_anom} (уменьшение или исчезновение строки — в суммы не входят).")
+        n_unknown = con_db.execute("SELECT COUNT(*) FROM increments WHERE plan_class='unknown'").fetchone()[0]
+        if n_unknown:
+            notes.append(f"Строки с незаписанным провайдером (plan unknown): {n_unknown} — в суточное окно не входят.")
+        db_note = ((db_note + " ") if db_note else "") + " ".join(notes)
     else:
         day = delta(snap.get("cumulative"), cumulative)   # старый путь: дельта от базы снимка
         since_commit = day
-        db_note = "База недоступна — сутки посчитаны дельтой от снимка 21:00 (старый путь)."
+        if not db_note:
+            db_note = "База недоступна — сутки посчитаны дельтой от снимка 21:00 (старый путь)."
         hours = None
         if snap.get("saved_at"):
             try:
                 ts = datetime.fromisoformat(snap["saved_at"]).timestamp()
                 hours = (time.time() - ts) / 3600
+                prev_commit = ts
             except Exception:
                 pass
         if hours is None:
-            db_note = "База 21:00 ещё не записана — среднее за час считается от полуночи."
+            db_note += " Среднее за час — от полуночи."
             lt = time.localtime()
             hours = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) / 3600
 
     lines = ["Сравнительная цена токенов — только локальные LLM (z.ai не считается)", "",
              f"Сэкономлено за последние сутки (локальные токены по ценам {LABEL}):",
-             block(day, p, rate),
-             f"- с 21:00 предыдущего запуска: {money(cost(since_commit, p), rate)}"]
+             block(day, p, rate)]
+    if prev_commit:
+        lines.append(f"- с 21:00 предыдущего запуска: {money(cost(since_commit, p), rate)}")
+    else:
+        lines.append(f"- с 21:00 предыдущего запуска: запуска 21:00 ещё нет — это то же суточное окно: "
+                     f"{money(cost(since_commit, p), rate)}")
     if hours >= 1 / 60:
         lines.append(f"- в среднем за час: {money(cost(since_commit, p) / hours, rate)}")
 
@@ -354,7 +427,10 @@ def main():
                          f"(база видит меньше source-таблицы: часть строк сессии была до создания базы "
                          f"или имеет незаписанный провайдер — plan unknown)")
 
-    lines += [f"Не учтено (z.ai coding plan): {zai/1e6:.2f}M токенов"]
+    lines += [f"Не учтено (z.ai coding plan): {(zai - zai_paid)/1e6:.2f}M токенов"]
+    if zai_paid:
+        lines.append(f"  отдельно — оплаченные z.ai (реально списанные деньги, это не план): "
+                     f"{zai_paid/1e6:.2f}M токенов")
 
     # разбивка по дням — сумма инкрементов по временным окнам из базы
     if con_db is not None:
@@ -386,6 +462,10 @@ def main():
                       "(ранее удалённые сессии восстановить нельзя)."]
     if db_note:
         lines += ["", db_note]
+    if not via_routing:
+        lines += ["", f"Сессия взята не через gateway_routing (chat {CHAT_ID}) — на другой машине "
+                      f"задай TOKEN_COST_CHAT_ID своим чатом, иначе блок «За текущую сессию» "
+                      f"может относиться не к тому пользователю."]
     if note:
         lines += ["", note]
     if rate_note:

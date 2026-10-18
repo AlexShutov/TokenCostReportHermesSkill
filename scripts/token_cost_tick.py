@@ -4,6 +4,9 @@
 """
 import os, runpy, sys
 
+# путь относительно самого файла, а не абсолютный путь автора: на машине коллеги
+# /Users/alex/... не существует, и крон-задача падает
+HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("TOKEN_COST_CRON_JOB", "token-counter")
 sys.argv = ["token_cost.py", "--tick"]
-runpy.run_path("/Users/alex/.hermes/scripts/token_cost.py", run_name="__main__")
+runpy.run_path(os.path.join(HERE, "token_cost.py"), run_name="__main__")

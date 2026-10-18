@@ -106,11 +106,18 @@ def src_connect():
     return sqlite3.connect(f"file:{SRC}?mode=ro", uri=True, timeout=10)
 
 
-def plan_class(billing_provider, billing_mode, actual_cost):
-    """План по записанному маршруту; реально списанные деньги — сильный сигнал."""
+def plan_class(billing_provider, billing_base_url, billing_mode, actual_cost):
+    """План по записанному маршруту; реально списанные деньги — сильный сигнал.
+
+    Важно: признак z.ai — НЕ только provider. В этой машине бывают строки с
+    provider='custom', но маршрутом на api.z.ai; SQL-фильтр навыка (ZAI_WHERE)
+    ловит их как z.ai, поэтому здесь тот же признак, иначе план-блок и
+    суточный блок считают одни и те же токены по-разному.
+    """
     if not billing_provider:
         return "unknown"
-    if billing_provider == "zai":
+    is_zai = billing_provider == "zai" or "api.z.ai" in (billing_base_url or "").lower()
+    if is_zai:
         if actual_cost and actual_cost > 0:
             return "zai_paid"
         if billing_mode in ("subscription", "subscription_included"):
@@ -145,15 +152,20 @@ def record_run(con, job, cron_job, profile, session_id, prices, rate, rate_sourc
                      "task, input_tokens, cache_read_tokens, output_tokens, actual_cost_usd, "
                      "first_seen, last_seen FROM session_model_usage").fetchall()
 
+    # последнее наблюдение каждого ключа ДО этого запуска — нужно и для прироста,
+    # и для обнаружения исчезнувших строк (сессия удалена)
+    last_by_key = {}
+    for row in con.execute("SELECT " + ", ".join(ROW_KEY) + ", input_tokens, cache_read_tokens, "
+                           "output_tokens, run_epoch FROM usage_snapshot"):
+        last_by_key[row[:6]] = row[6:11]
+
+    seen = set()
     added = 0
     for r in rows:
         key = r[:6]
-        prev = cur.execute("SELECT input_tokens, cache_read_tokens, output_tokens, run_epoch "
-                           "FROM usage_snapshot WHERE " +
-                           " AND ".join(f"{c}=?" for c in ROW_KEY) +
-                           " AND run_id<>? ORDER BY run_epoch DESC LIMIT 1",
-                           (*key, run_id)).fetchone()
-        pc = plan_class(key[2], key[4], r[9])
+        seen.add(key)
+        prev = last_by_key.get(key)
+        pc = plan_class(key[2], key[3], key[4], r[9])
         cur.execute("INSERT INTO usage_snapshot(run_id, run_at, run_epoch, " + ", ".join(ROW_KEY) +
                     ", plan_class, input_tokens, cache_read_tokens, output_tokens, actual_cost_usd, "
                     "first_seen, last_seen) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -186,6 +198,19 @@ def record_run(con, job, cron_job, profile, session_id, prices, rate, rate_sourc
                     + ", ".join(ROW_KEY) + ", plan_class, input_delta, cache_delta, output_delta, "
                     "attribution, note) VALUES(" + ",".join("?" * 17) + ")",
                     (run_id, now_iso(), t, w0, w1, *key, pc, d[0], d[1], d[2], a, note))
+
+    # Исчезнувшие строки: были в прошлом наблюдении, но их нет в source-таблице сейчас.
+    # Без этого база никогда не видит удаление сессии, хотя документация это обещает.
+    for key, prev in last_by_key.items():
+        if key in seen:
+            continue
+        pc = plan_class(key[2], key[3], key[4], 0)
+        added += 1
+        cur.execute("INSERT INTO increments(run_id, run_at, run_epoch, window_start, window_end, "
+                    + ", ".join(ROW_KEY) + ", plan_class, input_delta, cache_delta, output_delta, "
+                    "attribution, note) VALUES(" + ",".join("?" * 17) + ")",
+                    (run_id, now_iso(), t, prev[3], t, *key, pc, 0, 0, 0, "anomaly",
+                     "строка исчезла из source-таблицы (сессия удалена) — не входит в суммы"))
     con.commit()
     s.close()
     return run_id, added
