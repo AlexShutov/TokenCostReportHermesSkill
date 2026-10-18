@@ -21,6 +21,8 @@ ollama и любой провайдер, кроме z.ai). Токены z.ai cod
 import json, os, re, sqlite3, sys, time, urllib.request
 from datetime import datetime, timezone
 
+import token_cost_db as T          # append-only база: runs / usage_snapshot / increments
+
 CHAT_ID = "362122320"
 DB = os.path.expanduser("~/.hermes/state.db")
 SNAP = os.path.expanduser("~/.hermes/state/token_cost_snapshots.json")
@@ -228,7 +230,12 @@ def main():
         cumulative, ledger_fresh = bump_ledger(cur_all)
 
     if tick:
-        # копилка обновлена — отчёт печатает только полный запуск
+        # тик: без сети, значения из кэша; запись в базу и пустой stdout (тихо)
+        con_db = T.connect()
+        T.record_run(con_db, "tick", os.environ.get("TOKEN_COST_CRON_JOB"),
+                     os.environ.get("HERMES_PROFILE") or "default", sid,
+                     load_cache() or DEFAULTS, load_rate_cache() or DEFAULT_RATE,
+                     "cache", cumulative, None)
         return
 
     cur_sess = totals(c, sid) if sid else (0, 0, 0)
@@ -246,8 +253,10 @@ def main():
 
     live, err = fetch_prices()
     note = None
+    price_source = "default"
     if live:
         p = live
+        price_source = "live"
         try:
             os.makedirs(os.path.dirname(PRICE_CACHE), exist_ok=True)
             json.dump({"model": LABEL, **p, "fetched_at": datetime.now(timezone.utc).isoformat()},
@@ -256,13 +265,16 @@ def main():
             pass
     else:
         p = load_cache() or DEFAULTS
+        price_source = "cache" if load_cache() else "default"
         note = f"Цены с сайта взять не удалось ({err}) — использованы последние сохранённые."
 
     rate_note = None
+    rate_source = "default"
     if commit:
         # курс обновляется только на автоматическом запуске по расписанию
         rate, rate_err = fetch_rate()
         if rate:
+            rate_source = "live"
             try:
                 os.makedirs(os.path.dirname(RATE_CACHE), exist_ok=True)
                 json.dump({"tariff": TARIFF, "rate": rate,
@@ -272,60 +284,108 @@ def main():
                 pass
         else:
             rate = load_rate_cache() or DEFAULT_RATE
+            rate_source = "cache" if load_rate_cache() else "default"
             rate_note = (f"Курс «Плати по миру» обновить не удалось ({rate_err}) — "
                           f"использован сохранённый {rate:.2f}.")
     else:
         # прямой запуск: курс не трогаем, берём сохранённый
         rate = load_rate_cache() or DEFAULT_RATE
+        rate_source = "cache" if load_rate_cache() else "default"
 
-    day = delta(snap.get("cumulative"), cumulative)   # сутки = от базы 21:00, не от сессии
-    hours = None
-    if snap.get("saved_at"):
-        try:
-            ts = datetime.fromisoformat(snap["saved_at"]).timestamp()
-            hours = (time.time() - ts) / 3600
-        except Exception:
-            pass
-    day_note = None
-    if hours is None:
-        day_note = "База 21:00 ещё не записана — среднее за час считается от полуночи."
-        lt = time.localtime()
-        hours = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) / 3600
+    # --- база (append-only): каждое значение каждого запуска + таймстамп + провайдер/модель ---
+    con_db = None
+    if dry:
+        if os.path.exists(T.DB):
+            con_db = sqlite3.connect(f"file:{T.DB}?mode=ro", uri=True, timeout=10)
+    else:
+        con_db = T.connect()
+        T.record_run(con_db, "tick" if tick else ("commit" if commit else "manual"),
+                     os.environ.get("TOKEN_COST_CRON_JOB"),
+                     os.environ.get("HERMES_PROFILE") or "default",
+                     sid, p, rate, rate_source, cumulative, started)
+
+    now = time.time()
+    db_note = None
+    if con_db is not None:
+        day = T.window_sum(con_db, "local", now - 86400, now)
+        prev = con_db.execute("SELECT run_epoch FROM runs WHERE job='commit' ORDER BY run_epoch DESC LIMIT 1").fetchone()
+        prev_commit = prev[0] if prev else None
+        since_commit = T.window_sum(con_db, "local", prev_commit, now) if prev_commit else day
+        if prev_commit:
+            hours = (now - prev_commit) / 3600
+        else:
+            db_note = ("База ещё не имеет запуска 21:00 — среднее за час считается от полуночи, "
+                       "а суточное окно — только по строкам, записанным в базу.")
+            lt = time.localtime()
+            hours = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) / 3600
+        db_note = ((db_note + " ") if db_note else "") + (
+            "Суточное окно = сумма инкрементов по временным окнам из базы (append-only, ничего не удаляется); "
+            "строки, существовавшие до создания базы, атрибутированы точкой last_seen — это оценка.")
+    else:
+        day = delta(snap.get("cumulative"), cumulative)   # старый путь: дельта от базы снимка
+        since_commit = day
+        db_note = "База недоступна — сутки посчитаны дельтой от снимка 21:00 (старый путь)."
+        hours = None
+        if snap.get("saved_at"):
+            try:
+                ts = datetime.fromisoformat(snap["saved_at"]).timestamp()
+                hours = (time.time() - ts) / 3600
+            except Exception:
+                pass
+        if hours is None:
+            db_note = "База 21:00 ещё не записана — среднее за час считается от полуночи."
+            lt = time.localtime()
+            hours = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) / 3600
 
     lines = ["Сравнительная цена токенов — только локальные LLM (z.ai не считается)", "",
              f"Сэкономлено за последние сутки (локальные токены по ценам {LABEL}):",
              block(day, p, rate),
-             f"- с 21:00 предыдущего запуска: {money(cost(day, p), rate)}"]
+             f"- с 21:00 предыдущего запуска: {money(cost(since_commit, p), rate)}"]
     if hours >= 1 / 60:
-        lines.append(f"- в среднем за час: {money(cost(day, p) / hours, rate)}")
+        lines.append(f"- в среднем за час: {money(cost(since_commit, p) / hours, rate)}")
 
     lines += ["", "За текущую сессию (локальные токены):", block(cur_sess, p, rate)]
     if started:
         lines.append(f"- длительность сессии: {duration(time.time() - started)}")
+    if con_db is not None and sid:
+        ssum = T.session_sum(con_db, sid, "local")
+        if ssum != cur_sess:
+            lines.append(f"- по базе за эту сессию: {ssum[0]/1e6:.2f}M / {ssum[1]/1e6:.2f}M / {ssum[2]/1e6:.2f}M "
+                         f"(база видит меньше source-таблицы: часть строк сессии была до создания базы "
+                         f"или имеет незаписанный провайдер — plan unknown)")
 
     lines += [f"Не учтено (z.ai coding plan): {zai/1e6:.2f}M токенов"]
 
-    # разбивка локальных токенов по дням (по дате last_seen), последние 4 дня
-    try:
-        rows = c.execute(
-            "SELECT date(last_seen, 'unixepoch', 'localtime') d, "
-            "SUM(input_tokens), SUM(cache_read_tokens), SUM(output_tokens) "
-            f"FROM session_model_usage WHERE NOT {ZAI_WHERE} GROUP BY d ORDER BY d DESC LIMIT 4"
-        ).fetchall()
+    # разбивка по дням — сумма инкрементов по временным окнам из базы
+    if con_db is not None:
+        rows = T.daily(con_db, "local", 4)
+    else:
+        rows = []
+    if rows:
         day_lines = []
         for d, i_, c_, o_ in rows:
             t = (i_ or 0, c_ or 0, o_ or 0)
             day_lines.append(f"- {d}: {sum(t)/1e6:.2f}M = {money(cost(t, p), rate)}")
-        if day_lines:
-            lines += ["", "По дням (локальные токены):"] + day_lines
-    except Exception:
-        pass
+        lines += ["", "По дням (локальные токены):"] + day_lines
+    elif con_db is None:
+        try:
+            rows = c.execute(
+                "SELECT date(last_seen, 'unixepoch', 'localtime') d, "
+                "SUM(input_tokens), SUM(cache_read_tokens), SUM(output_tokens) "
+                f"FROM session_model_usage WHERE NOT {ZAI_WHERE} GROUP BY d ORDER BY d DESC LIMIT 4"
+            ).fetchall()
+            day_lines = [f"- {d}: {sum((i_ or 0, c_ or 0, o_ or 0))/1e6:.2f}M = "
+                         f"{money(cost((i_ or 0, c_ or 0, o_ or 0), p), rate)}" for d, i_, c_, o_ in rows]
+            if day_lines:
+                lines += ["", "По дням (локальные токены, старый путь по last_seen):"] + day_lines
+        except Exception:
+            pass
 
     if ledger_fresh:
         lines += ["", "Копилка создана только что — «за всё время» считается с этого момента "
                       "(ранее удалённые сессии восстановить нельзя)."]
-    if day_note:
-        lines += ["", day_note]
+    if db_note:
+        lines += ["", db_note]
     if note:
         lines += ["", note]
     if rate_note:
