@@ -31,7 +31,9 @@ def run(path, *args, env=None):
     e["TOKEN_COST_CHAT_ID"] = CHAT
     if env:
         e.update(env)
-    p = subprocess.run([PY, path] + list(args), capture_output=True, text=True, env=e, timeout=120)
+    # setup.sh — это bash, а не python: запускать его интерпретатором python нельзя
+    argv = ["bash", path] if path.endswith(".sh") else [PY, path]
+    p = subprocess.run(argv + list(args), capture_output=True, text=True, env=e, timeout=120)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -105,7 +107,7 @@ def main():
     check("dry-run прошёл", rc == 0, (err or "").strip()[:160])
     check("dry-run ничего не записал", not os.path.exists(os.path.join(state, "token_cost.db"))
           and not os.path.exists(os.path.join(state, "token_cost_ledger.json")),
-          "файлы появились после dry-run")
+          "после dry-run в state/ нет ни базы, ни копилки")
     check("формат отчёта", "Сравнительная цена токенов — только локальные LLM" in out
           and "курс взят из «Плати по миру»" in out)
     check("z.ai разделён на план и оплату", "оплаченные" in out,
