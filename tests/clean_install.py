@@ -84,6 +84,8 @@ def main():
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"))
     check("setup.sh проходит", rc == 0, (err or out).strip()[:160])
     check("setup.sh создаёт state/", os.path.isdir(state))
+    check("setup.sh предлагает выбрать день начала подписки",
+          "--set-anchor" in out and "начал" in out.lower(), out.strip()[:160])
 
     # 3. скрипты в ~/.hermes/scripts (крон исполняет только оттуда)
     os.makedirs(scripts, exist_ok=True)
@@ -110,10 +112,12 @@ def main():
     check("dry-run ничего не записал", not os.path.exists(os.path.join(state, "token_cost.db"))
           and not os.path.exists(os.path.join(state, "token_cost_ledger.json")),
           "после dry-run в state/ нет ни базы, ни копилки")
-    check("формат отчёта", "Сравнительная цена токенов — только локальные LLM" in out
-          and "курс взят из «Плати по миру»" in out)
-    check("z.ai разделён на план и оплату", "оплаченные" in out,
-          out.split("Не учтено")[1].split("\n")[0] if "Не учтено" in out else "")
+    check("формат отчёта начинается с оценки плана",
+          out.splitlines()[0].startswith("Равно") and "на Z.ai" in out
+          and "курс взят из «Плати по миру»" in out, out.splitlines()[0])
+    check("расчёт токенов — частный случай: при незаполненном плане не печатается",
+          "Расчёт токенов не применяется" in out and "Сэкономлено за последние сутки" not in out,
+          out.splitlines()[0])
 
     # 7. тик через обёртку (именно так его зовёт крон): молчит, пишет run
     rc, out, err = run(os.path.join(scripts, "token_cost_tick.py"))
@@ -166,8 +170,35 @@ def main():
           "строка 'использовано X% Y плана' не печатается")
     check("блок плана называет, что месячный лимит выведен", "только 5-часовой и недельный" in out, out[-400:])
 
-    # 10. тесты навыка на чистой копии
-    for tf in ("test_token_cost.py", "test_plan_usage.py"):
+    # 10. переполнение Max — частный случай: включается расчёт токенов
+    #     и показывает только число переполнения, а не общее количество
+    import time as _time
+    con = sqlite3.connect(db)
+    now = int(_time.time())
+    con.execute("INSERT INTO runs(run_at, run_epoch, job, cron_job, profile, session_id, "
+                "session_started_at, session_seconds, prices_json, rate, rate_source, ledger_json) "
+                "VALUES('x', ?, 'manual', NULL, 'colleague', 's1', NULL, NULL, '{}', 0, 'default', '{}')",
+                (now,))
+    rid = con.execute("SELECT MAX(run_id) FROM runs").fetchone()[0]
+    con.execute("INSERT INTO increments(run_id, run_at, run_epoch, window_start, window_end, session_id, "
+                "model, billing_provider, billing_base_url, billing_mode, task, plan_class, input_delta, "
+                "cache_delta, output_delta, attribution, note) VALUES(?, 'x', ?, ?, ?, 's1', "
+                "'glm-5.3-flash', 'zai', 'https://api.z.ai', '', 'chat', 'zai_plan_by_rule', "
+                "7000000000, 0, 0, 'delta', '')", (rid, now, now - 100, now))
+    con.commit()
+    con.close()
+    rc, out, err = run(os.path.join(scripts, "token_cost.py"))
+    check("переполнение Max даёт сообщение о переходе",
+          "План Max переполнен, переходим на пересчет токенов." in out, out[:200])
+    check("частный случай: расчёт токенов включён",
+          "Пересчёт токенов — только переполнение Max" in out, out[:200])
+    tail = out.split("Пересчёт токенов", 1)[-1]
+    check("показывается только переполнение, не общее количество токенов",
+          "7000.00M" not in tail, tail[:160])
+    check("z.ai разделён на план и оплату", "оплаченные" in tail, tail[:160])
+
+    # 11. тесты навыка на чистой копии
+    for tf in ("test_plan_core.py", "test_plan_usage.py", "test_token_cost.py"):
         r = subprocess.run([PY, os.path.join(skill, "tests", tf)],
                            capture_output=True, text=True, env={**os.environ, "HOME": HOME}, timeout=300)
         check(f"тесты навыка на чистой копии ({tf})", r.returncode == 0,

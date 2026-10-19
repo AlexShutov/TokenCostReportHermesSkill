@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Тесты блока эквивалентного кодового плана z.ai (stdlib, offline, Python 3.9+).
+"""Тесты CLI-обёртки блока плана (plan_usage.py).
 
-Запуск: python3 tests/test_plan_usage.py
-Каждый тест — в отдельном временном HOME; база строится прямыми INSERT в
-increments (временные окна задаёт тест), сеть не трогается.
+Логика ядра (формула кредитов, пик, каскад, окно, расщепление переполнения)
+тестируется поведенчески в test_plan_core.py. Здесь — поведение обёртки:
+аргументы, состояние, деградация, запись перехода плана, доставляемый блок.
+Только stdlib, offline, Python 3.9+. Запуск: python3 tests/test_plan_usage.py
+Каждый тест — в отдельном временном HOME; инкременты сеются прямыми INSERT.
 """
 import contextlib
 import io
+import json
 import os
+import re
 import shutil
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -20,9 +23,6 @@ SCRIPTS = os.path.join(SKILL, "scripts")
 sys.path.insert(0, SCRIPTS)
 
 PEAK_TZ = timezone(timedelta(hours=8))
-SRC_COLS = ("session_id", "model", "billing_provider", "billing_base_url", "billing_mode",
-            "task", "input_tokens", "cache_read_tokens", "output_tokens", "actual_cost_usd",
-            "first_seen", "last_seen")
 INC_COLS = ("run_id", "run_at", "run_epoch", "window_start", "window_end", "session_id",
             "model", "billing_provider", "billing_base_url", "billing_mode", "task",
             "plan_class", "input_delta", "cache_delta", "output_delta", "attribution", "note")
@@ -34,14 +34,18 @@ def ts(y, m, d, h, mi, tz=PEAK_TZ):
 
 class Case(unittest.TestCase):
     def setUp(self):
+        # обёртка решает пути при импорте — тест обязан выгружать модули из
+        # sys.modules, иначе они читают HOME предыдущего теста
+        for name in ("token_cost", "token_cost_db", "plan_core", "plan_usage"):
+            sys.modules.pop(name, None)
         self.home = tempfile.mkdtemp(prefix="tcr-plan-")
         os.environ["HOME"] = self.home
-        for name in ("token_cost_db", "plan_usage"):
-            sys.modules.pop(name, None)
         import token_cost_db as T
-        import plan_usage as P
-        self.T, self.P = T, P
+        import plan_core as C
+        import plan_usage as U
+        self.T, self.C, self.U = T, C, U
         self.con = self.T.connect()
+        self.plan_file = os.path.join(self.home, ".hermes", "state", "token_cost_plan.json")
 
     def tearDown(self):
         self.con.close()
@@ -57,160 +61,111 @@ class Case(unittest.TestCase):
                              (rid, datetime.now(PEAK_TZ).isoformat(), r[1], "test", None, "default",
                               "s1", None, None, "{}", 0, "test", "{}"))
             self.con.execute("INSERT INTO increments(" + ", ".join(INC_COLS) + ") VALUES(" +
-                             ",".join("?" * len(INC_COLS)) + ")",
+                             ", ".join("?" * len(INC_COLS)) + ")",
                              (rid, datetime.now(PEAK_TZ).isoformat(), r[1], r[0], r[1], "s1", r[2],
                               "zai", "https://api.z.ai", "", "", r[3], r[4], r[5], r[6], r[7], ""))
         self.con.commit()
 
     def capture(self, argv):
-        sys.argv = ["plan_usage.py"] + argv
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            self.P.main()
-        return buf.getvalue()
+            code = self.U.main(argv)
+        return code, buf.getvalue()
+
+    def state(self):
+        if not os.path.exists(self.plan_file):
+            return {}
+        with open(self.plan_file) as f:
+            return json.load(f)
 
 
-# --- формула кредитов ---------------------------------------------------------
-class CreditFormula(Case):
-    def test_worked_example_peak(self):
-        # 100 000 input (95 000 из них кэш) + 2 000 output на Flash, всё в пике
-        toks = {"input": 5000, "cached": 95000, "output": 2000}
-        self.assertAlmostEqual(self.P.credits_for(toks, self.P.MULTIPLIERS["glm-5.3-flash"], 1.0), 8.07, places=6)
+# --- только python3 ------------------------------------------------------------
+class Python3Only(Case):
+    def test_no_requests_and_shebang_is_python3(self):
+        bad = []
+        for f in sorted(os.listdir(SCRIPTS)):
+            if not f.endswith(".py"):
+                continue
+            with open(os.path.join(SCRIPTS, f)) as fh:
+                text = fh.read()
+            if re.search(r"^\s*import requests\b", text, re.M):
+                bad.append(f)
+            for line in text.splitlines():
+                if line.strip().startswith("#!") and "python3" not in line:
+                    bad.append(f)
+        self.assertEqual(bad, [])
 
-    def test_offpeak_is_half(self):
-        toks = {"input": 5000, "cached": 95000, "output": 2000}
-        f = self.P.credits_for(toks, self.P.MULTIPLIERS["glm-5.3-flash"], 0.0)
-        self.assertAlmostEqual(f, 4.035, places=6)
-        self.assertAlmostEqual(f, self.P.credits_for(toks, self.P.MULTIPLIERS["glm-5.3-flash"], 1.0) * 0.5, places=6)
-
-    def test_blended_window(self):
-        # половина окна в пике -> коэффициент 0.75: 2.3 * 0.75 = 1.725
-        toks = {"input": 10000, "cached": 0, "output": 0}
-        self.assertAlmostEqual(self.P.credits_for(toks, self.P.MULTIPLIERS["glm-5.3-flash"], 0.5), 1.725, places=6)
-
-    def test_glm53_multipliers(self):
-        toks = {"input": 10000, "cached": 0, "output": 0}
-        self.assertAlmostEqual(self.P.credits_for(toks, self.P.MULTIPLIERS["glm-5.3"], 1.0), 6.9, places=6)
-
-    def test_by_actual_model(self):
-        # строка glm-5.3 считается мультипликаторами glm-5.3, а не эквивалентной модели
-        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3",
-                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
-        out = self.capture(["--month", "2026-10", "--dry-run", "--by-actual-model"])
-        self.assertIn("6.9", out)
-        # 6.9 кредитов (в пике), против 2.3 по эквивалентной модели
-        self.assertIn("6.9", out.split("Кредиты за окно:")[1].split("\n")[0])
-        out2 = self.capture(["--month", "2026-10", "--dry-run"])
-        self.assertIn("2.3", out2)
+    def test_core_has_no_third_party_imports(self):
+        with open(os.path.join(SCRIPTS, "plan_core.py")) as fh:
+            text = fh.read()
+        for line in text.splitlines():
+            m = re.match(r"\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m:
+                name = m.group(1)
+                self.assertIn(name, {"json", "os", "sqlite3", "sys", "datetime", "calendar",
+                                     "abc", "typing", "token_cost", "token_cost_db", "plan_core"},
+                                "импорт не из stdlib: %s" % name)
 
 
-# --- пик / офф-пик ------------------------------------------------------------
-class PeakOffpeak(Case):
-    def test_peak_window(self):
-        self.assertAlmostEqual(self.P.peak_fraction(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 16, 0)), 1.0)
-
-    def test_weekend_all_day_offpeak(self):
-        # воскресенье 15:00-16:00 SGT — внепик весь день
-        self.assertAlmostEqual(self.P.peak_fraction(ts(2026, 10, 18, 15, 0), ts(2026, 10, 18, 16, 0)), 0.0)
-
-    def test_partial_peak(self):
-        # пн 13:00 -> пн 15:00 SGT: пик только 14:00-15:00 = 1/2 окна
-        self.assertAlmostEqual(self.P.peak_fraction(ts(2026, 10, 19, 13, 0), ts(2026, 10, 19, 15, 0)), 0.5)
-
-    def test_multi_day_window(self):
-        # пн 17:00 -> вт 15:00 SGT: пик 17-18 (1 ч) + 14-15 (1 ч) = 2 ч из 22 ч
-        f = self.P.peak_fraction(ts(2026, 10, 19, 17, 0), ts(2026, 10, 20, 15, 0))
-        self.assertAlmostEqual(f, 2.0 / 22.0, places=6)
-
-    def test_point_window_uses_moment(self):
-        # backfill: window_start == window_end, решение по моменту last_seen
-        self.assertAlmostEqual(self.P.peak_fraction(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 0)), 1.0)
-        self.assertAlmostEqual(self.P.peak_fraction(ts(2026, 10, 18, 15, 0), ts(2026, 10, 18, 15, 0)), 0.0)
-
-    def test_saturday_point(self):
-        self.assertAlmostEqual(self.P.peak_fraction(ts(2026, 10, 17, 15, 0), ts(2026, 10, 17, 15, 0)), 0.0)
-
-
-# --- якорь месяца -------------------------------------------------------------
+# --- якорь месяца ---------------------------------------------------------------
 class Anchor(Case):
-    def test_default_anchor_is_first_day(self):
-        st = self.P.default_state()
-        self.assertEqual(st["anchor_day"], 1)
-        self.assertEqual(st["anchor_source"], "default")
+    def test_default_anchor_day_is_19(self):
+        # правило пользователя: при установке навыка с нуля предлагается 19-е число,
+        # чтобы данные, уже имеющиеся в базе, попали в расчёт
+        self.assertEqual(self.U.DEFAULT_ANCHOR_DAY, 19)
 
-    def test_set_anchor_persists(self):
-        out = self.capture(["--set-anchor", "15"])
+    def test_default_anchor_used_when_nothing_saved(self):
+        code, out = self.capture(["--month", "2026-10"])
+        self.assertEqual(code, 0)
+        self.assertIn("день начала отсчёта — 19 (default_derived)", out)
+
+    def test_set_anchor_persists_and_wins_over_default(self):
+        code, out = self.capture(["--set-anchor", "15"])
+        self.assertEqual(code, 0)
         self.assertIn("сохранён: 15", out)
-        st = self.P.load_state()
-        self.assertEqual(st["anchor_day"], 15)
-        self.assertEqual(st["anchor_source"], "user")
-        # месяц отсчёта начинается с 15-го
-        s, e, days = self.P.month_window(15, datetime(2026, 10, 20, tzinfo=PEAK_TZ))
-        self.assertEqual(s.day, 15)
-        self.assertEqual(days, 31)          # 15 октября -> 15 ноября
+        self.assertEqual(self.state()["anchor_date"], "2026-10-15")
+        code, out = self.capture(["--month", "2026-10"])
+        self.assertIn("день начала отсчёта — 15 (saved)", out)
 
     def test_date_anchor(self):
-        d, full = self.P.anchor_day_from("2026-10-15")
-        self.assertEqual(d, 15)
-        self.assertEqual(full, "2026-10-15")
+        d = self.C.parse_anchor("2026-10-15")
+        self.assertEqual(d.day, 15)
+        self.assertEqual(d.isoformat(), "2026-10-15")
 
     def test_anchor_day_missing_in_month_clamps(self):
-        # якорь 31, февраль: дня 31 нет -> берётся последний день месяца (ограничение)
-        s, e, days = self.P.month_window(31, datetime(2026, 2, 10, tzinfo=PEAK_TZ))
-        self.assertEqual(s.day, 28)
-        self.assertEqual(days, 31)          # 28 февраля -> 31 марта
+        # якорь 31, февраль: дня 31 нет — берётся последний день месяца, это называется
+        code, out = self.capture(["--set-anchor", "31", "--month", "2026-02"])
+        self.assertIn("ограничение метода", out)
 
     def test_dry_run_writes_nothing(self):
-        self.capture(["--dry-run", "--month", "2026-10"])
-        self.assertFalse(os.path.exists(self.P.PLAN_FILE))
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.plan_file))
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 0)
         self.assertEqual(self.con.execute("SELECT COUNT(*) FROM increments").fetchone()[0], 0)
 
+    def test_invalid_plan_and_model_return_2(self):
+        self.assertEqual(self.capture(["--plan", "ultra"])[0], 2)
+        self.assertEqual(self.capture(["--model", "glm-9"])[0], 2)
+        self.assertEqual(self.capture(["--peak", "moon"])[0], 2)
 
-# --- месячный лимит и каскад -------------------------------------------------
-class Caps(Case):
-    def test_monthly_cap_is_derived_from_weekly(self):
-        # Light: 10000 x (30/7) — на сайте месячного лимита нет, это вывод
-        self.assertAlmostEqual(self.P.monthly_cap("light", 30), 10000 * 30 / 7.0, places=6)
-        self.assertEqual(self.P.PLANS["light"], {"5h": 2000, "weekly": 10000})
-        self.assertEqual(self.P.PLANS["pro"], {"5h": 12000, "weekly": 60000})
-        self.assertEqual(self.P.PLANS["max"], {"5h": 28000, "weekly": 140000})
 
-    def test_cascade_light_then_pro(self):
-        # окно 1 октября -> 1 ноября = 31 день; Light = 10000 x 31/7 = 44285.7
-        # 45 000 кредитов -> Light 100%, излишек переносится на Pro
-        res, days = self.P.cascade(45000.0, 1, datetime(2026, 10, 20, tzinfo=PEAK_TZ))
-        self.assertEqual(days, 31)
-        self.assertEqual(res[0]["plan"], "light")
-        self.assertAlmostEqual(res[0]["pct"], 100.0)
-        self.assertEqual(res[1]["plan"], "pro")
-        self.assertAlmostEqual(res[1]["pct"], (45000 - 10000 * 31 / 7.0) / (60000 * 31 / 7.0) * 100.0, places=6)
-
-    def test_cascade_light_pro_max(self):
-        res, days = self.P.cascade(400000.0, 1, datetime(2026, 10, 20, tzinfo=PEAK_TZ))
-        self.assertEqual([r["plan"] for r in res], ["light", "pro", "max"])
-        self.assertAlmostEqual(res[0]["pct"], 100.0)
-        self.assertAlmostEqual(res[1]["pct"], 100.0)
-        cap_max = 140000 * 31 / 7.0
-        rem = 400000 - 10000 * 31 / 7.0 - 60000 * 31 / 7.0
-        self.assertAlmostEqual(res[2]["pct"], rem / cap_max * 100.0, places=6)
-
-    def test_under_light_cap_single_line(self):
-        res, days = self.P.cascade(1000.0, 1, datetime(2026, 10, 20, tzinfo=PEAK_TZ))
-        self.assertEqual(len(res), 1)
-        self.assertAlmostEqual(res[0]["pct"], 1000 / (10000 * 31 / 7.0) * 100.0, places=6)
-
-    def test_block_prints_the_required_phrase(self):
+# --- доставляемый блок ----------------------------------------------------------
+class Block(Case):
+    def test_first_line_is_plan_equivalence(self):
+        # 7 453 416 входных токенов = 1000 кредитов (2.3 x 7/12 на 10000 токенов)
+        # -> 1000 / 44285.7 = 2.258% -> "Равно 2.3%"
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
-        out = self.capture(["--dry-run", "--month", "2026-10"])
+                   "zai_plan_by_rule", 7453416, 0, 0, "delta")])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertEqual(out.splitlines()[0], "Равно 2.3% плана Light на Z.ai")
         self.assertIn("использовано", out)
         self.assertIn("Light плана", out)
         self.assertIn("месячного лимита", out)
         self.assertIn("только 5-часовой и недельный", out)
 
     def test_block_names_the_derivation(self):
-        out = self.capture(["--dry-run", "--month", "2026-10"])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("выведен из недельного", out)
 
     def test_anomaly_rows_not_counted(self):
@@ -218,38 +173,35 @@ class Caps(Case):
                    "zai_plan_by_rule", 10000, 0, 0, "delta"),
                    (ts(2026, 10, 19, 15, 30), ts(2026, 10, 19, 16, 0), "glm-5.3-flash",
                     "zai_plan_by_rule", -5000, 0, 0, "anomaly")])
-        out = self.capture(["--dry-run", "--month", "2026-10"])
-        # только 10 000 входных токенов, а не 5 000
-        self.assertIn("0.01M", out)
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertIn("0.01M", out)          # только 10 000, а не 5 000
 
     def test_local_rows_not_counted_in_plan(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "qwen",
                    "local", 100000, 0, 0, "delta")])
-        out = self.capture(["--dry-run", "--month", "2026-10"])
-        self.assertIn("Кредиты за окно: 0.0", out)
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertIn("Строк плана в окне нет", out)
 
     def test_rows_outside_month_window_excluded(self):
-        # строка в сентябре — вне месячного окна октября
         self.seed([(ts(2026, 9, 30, 15, 0), ts(2026, 9, 30, 15, 30), "glm-5.3-flash",
                    "zai_plan_by_rule", 100000, 0, 0, "delta")])
-        out = self.capture(["--dry-run", "--month", "2026-10"])
-        self.assertIn("Кредиты за окно: 0.0", out)
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertIn("Строк плана в окне нет", out)
 
     def test_unknown_model_named(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-4.7",
                    "zai_plan_by_rule", 10000, 0, 0, "delta")])
-        out = self.capture(["--dry-run", "--month", "2026-10"])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("без опубликованных мультипликаторов", out)
         self.assertIn("glm-4.7", out)
 
     def test_mcp_limitation_stated(self):
-        out = self.capture(["--dry-run", "--month", "2026-10"])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("MCP-вызовы", out)
 
     def test_block_names_degradation_when_base_missing(self):
-        # база недоступна — блок печатает заголовок, честную строку и оговорку о выводе
         self.T.DB = os.path.join(self.home, "no-such.db")
-        out = self.capture(["--dry-run", "--month", "2026-10"])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("Эквивалентный кодовый план z.ai", out)
         self.assertIn("не посчитан", out)
         self.assertIn("только 5-часовой и недельный", out)
@@ -258,8 +210,61 @@ class Caps(Case):
     def test_point_rows_flagged_as_estimate(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 0), "glm-5.3-flash",
                    "zai_plan_by_rule", 10000, 0, 0, "backfill")])
-        out = self.capture(["--dry-run", "--month", "2026-10"])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("оценка", out)
+
+    def test_by_actual_model_uses_row_multipliers(self):
+        # 10000 токенов glm-5.3: по мультипликаторам строки = 6.9 x 7/12 = 4.025 кредита,
+        # по эквивалентной модели = 2.3 x 7/12 = 1.342
+        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3",
+                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
+        code, out = self.capture(["--dry-run", "--month", "2026-10", "--by-actual-model"])
+        self.assertIn("по мультипликаторам фактической модели", out)
+        self.assertIn("Кредиты за окно: 4.0", out)
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertIn("Кредиты за окно: 1.3", out)
+
+    def test_default_peak_names_day_integral(self):
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertIn("интегральная оценка по дню", out)
+
+    def test_window_peak_names_the_approximation(self):
+        code, out = self.capture(["--dry-run", "--month", "2026-10", "--peak", "window"])
+        self.assertIn("приближение", out)
+        self.assertIn("по моменту каждого запроса", out)
+
+
+# --- переход плана ---------------------------------------------------------------
+class Transition(Case):
+    def test_overflow_message_and_state_write(self):
+        # 400M входных токенов = 53666.7 кредитов > месячного лимита Light (44285.7)
+        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
+                   "zai_plan_by_rule", 400000000, 0, 0, "delta")])
+        code, out = self.capture(["--month", "2026-10"])
+        self.assertIn("Превышен план Light, перешли на Pro", out)
+        self.assertEqual(self.state()["plan"], "pro")
+
+    def test_no_message_when_plan_unchanged(self):
+        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
+                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
+        code, out = self.capture(["--month", "2026-10"])
+        self.assertNotIn("Превышен", out)
+        self.assertEqual(self.state()["plan"], "light")
+
+    def test_dry_run_does_not_write_plan_state(self):
+        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
+                   "zai_plan_by_rule", 400000000, 0, 0, "delta")])
+        code, out = self.capture(["--dry-run", "--month", "2026-10"])
+        self.assertIn("Превышен план Light, перешли на Pro", out)
+        self.assertFalse(os.path.exists(self.plan_file))
+
+    def test_max_overflow_message(self):
+        # суммарный лимит каскада = 44285.7 + 265714.3 + 620000 = 930000 кредитов;
+        # 7 млрд входных токенов = 940833.3 кредитов — за пределами Max
+        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
+                   "zai_plan_by_rule", 7000000000, 0, 0, "delta")])
+        code, out = self.capture(["--month", "2026-10"])
+        self.assertIn("План Max переполнен, переходим на пересчет токенов.", out)
 
 
 if __name__ == "__main__":

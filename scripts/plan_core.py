@@ -57,6 +57,15 @@ PLAN_ORDER = ("light", "pro", "max")
 MAX_PLAN = "max"
 ZAI_PLANS = ("zai_plan", "zai_plan_by_rule", "zai_paid")
 
+# Дефолт дня начала отсчёта месяца при установке навыка с нуля (запрос пользователя,
+# 2026-10-20): 19-е число — чтобы данные, уже имеющиеся в базе, попали в расчёт.
+DEFAULT_ANCHOR_DAY = 19
+
+
+def as_tuple(tokens):
+    """(input, cached, output) — порядок, которого ждёт прежний расчёт токенов."""
+    return (tokens["input"], tokens["cached"], tokens["output"])
+
 
 def zero_tokens():
     return {"input": 0.0, "cached": 0.0, "output": 0.0}
@@ -77,6 +86,10 @@ class PeakModel(ABC):
     @abstractmethod
     def share(self, day, window_start=None, window_end=None) -> Optional[float]:
         """Доля пика для дня (или для окна, если реализация её использует)."""
+
+    def describe(self):
+        return ("интегральная оценка по дню (модель %s): будний день 4/24 часа пика, суббота и "
+                "воскресенье — весь день вне пика; момент конкретного вызова не используется" % self.name)
 
 
 class DayIntegralPeakModel(PeakModel):
@@ -99,6 +112,11 @@ class WindowPeakModel(PeakModel):
     """Прежняя логика: доля конкретного окна в пике. Точечное окно решается по моменту."""
 
     name = "window"
+
+    def describe(self):
+        return ("доля временного окна в пике (модель %s) — это приближение: z.ai списывает по моменту "
+                "каждого запроса, а база хранит окна между наблюдениями, поэтому пик делится по времени "
+                "окна пропорционально, а не поштучно" % self.name)
 
     def _is_peak(self, epoch):
         dt = datetime.fromtimestamp(epoch, PEAK_TZ)
@@ -155,6 +173,9 @@ class MultiplierRegistry:
     def known(self, model):
         return (model or "").lower() in self._table
 
+    def known_models(self):
+        return sorted(self._table)
+
     def fallback_model(self):
         return self._fallback
 
@@ -166,6 +187,9 @@ class PlanRegistry:
 
     def order(self):
         return list(self._plans.keys())
+
+    def known(self, plan):
+        return plan in self._plans
 
     def weekly(self, plan):
         return self._plans[plan]["weekly"]
@@ -206,7 +230,21 @@ class MonthWindow:
 class IncrementSource(ABC):
     @abstractmethod
     def rows(self, window) -> List[dict]:
-        """Строки окна: dict(model, plan_class, attribution, window_start, window_end, tokens)."""
+        """Строки окна: dict(session_id, model, plan_class, attribution, window_start,
+        window_end, tokens)."""
+
+    def anomalies(self, window) -> int:
+        """Anomaly-строки окна: они не входят в суммы, но остаются в базе."""
+        return 0
+
+    def unknown_count(self, window) -> int:
+        """Строки окна с незаписанным провайдером (plan unknown) — в оценку не входят."""
+        return 0
+
+    def before_window(self, window) -> tuple:
+        """Строки базы ДО начала окна: (число, токены). Они относятся к предыдущему
+        месячному окну и в оценку не входят — блок обязан это назвать."""
+        return (0, 0)
 
 
 class InMemoryIncrementSource(IncrementSource):
@@ -215,6 +253,21 @@ class InMemoryIncrementSource(IncrementSource):
 
     def rows(self, window):
         return [r for r in self._rows if window.contains(r["window_end"])]
+
+    def anomalies(self, window):
+        return sum(1 for r in self._rows if r["attribution"] == "anomaly"
+                   and window.contains(r["window_end"]))
+
+    def unknown_count(self, window):
+        return sum(1 for r in self._rows if r["plan_class"] == "unknown"
+                   and window.contains(r["window_end"]))
+
+    def before_window(self, window):
+        rows = [r for r in self._rows if r["window_end"] < window.start.timestamp()]
+        tot = zero_tokens()
+        for r in rows:
+            add_tokens(tot, r["tokens"])
+        return (len(rows), sum(tot.values()))
 
 
 class SqliteIncrementSource(IncrementSource):
@@ -227,17 +280,50 @@ class SqliteIncrementSource(IncrementSource):
         try:
             ph = ",".join("?" * len(self._plan_classes))
             cur = con.execute(
-                "SELECT model, plan_class, attribution, window_start, window_end, "
+                "SELECT session_id, model, plan_class, attribution, window_start, window_end, "
                 "input_delta, cache_delta, output_delta FROM increments "
                 "WHERE attribution<>'anomaly' AND plan_class IN (" + ph + ") "
                 "AND window_end>=? AND window_start<=?",
                 list(self._plan_classes) + [window.start.timestamp(), window.end.timestamp()])
             rows = []
             for r in cur.fetchall():
-                rows.append({"model": r[0], "plan_class": r[1], "attribution": r[2],
-                             "window_start": r[3], "window_end": r[4],
-                             "tokens": {"input": r[5] or 0, "cached": r[6] or 0, "output": r[7] or 0}})
+                rows.append({"session_id": r[0], "model": r[1], "plan_class": r[2],
+                             "attribution": r[3], "window_start": r[4], "window_end": r[5],
+                             "tokens": {"input": r[6] or 0, "cached": r[7] or 0,
+                                        "output": r[8] or 0}})
             return rows
+        finally:
+            con.close()
+
+    def anomalies(self, window):
+        con = self._conn_factory()
+        try:
+            return con.execute(
+                "SELECT COUNT(*) FROM increments WHERE attribution='anomaly' "
+                "AND window_end>=? AND window_start<=?",
+                (window.start.timestamp(), window.end.timestamp())).fetchone()[0]
+        finally:
+            con.close()
+
+    def unknown_count(self, window):
+        con = self._conn_factory()
+        try:
+            return con.execute(
+                "SELECT COUNT(*) FROM increments WHERE plan_class='unknown' "
+                "AND window_end>=? AND window_start<=?",
+                (window.start.timestamp(), window.end.timestamp())).fetchone()[0]
+        finally:
+            con.close()
+
+    def before_window(self, window):
+        con = self._conn_factory()
+        try:
+            ph = ",".join("?" * len(self._plan_classes))
+            row = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(input_delta+cache_delta+output_delta),0) "
+                "FROM increments WHERE plan_class IN (" + ph + ") AND window_end < ?",
+                list(self._plan_classes) + [window.start.timestamp()]).fetchone()
+            return (row[0], row[1])
         finally:
             con.close()
 
@@ -292,30 +378,68 @@ class OverflowLedger:
         self._mult = multipliers
         self._peak = peak_model
 
-    def split(self, rows, max_cap):
-        within, overflow = zero_tokens(), zero_tokens()
-        acc = 0.0
+    def split(self, rows, caps):
+        """caps — [(план, лимит)] по порядку каскада.
+
+        Возвращает (within по планам, overflow, details), где details —
+        (строка, доля переполнения): из неё группируют дни и сессии прежнего
+        расчёта токенов. Строки идут хронологически: более ранняя строка не может
+        «съесть» лимит более поздней.
+        """
+        within = [zero_tokens() for _ in caps]
+        accs = [0.0] * len(caps)
+        overflow = zero_tokens()
+        details = []
         for r in sorted(rows, key=lambda x: x["window_end"]):
-            share = self._peak.share(self._peak_day(r), r["window_start"], r["window_end"])
-            c = self._calc.credits(r["tokens"], self._mult.for_model(r["model"]), share)
+            c = self._row_credits(r)
             if c is None:
+                details.append((r, None, None))
                 continue
-            if acc + c <= max_cap:
-                add_tokens(within, r["tokens"])
-            else:
+            rem = c
+            for i, (_plan, cap) in enumerate(caps):
                 # room обязан быть неотрицательным: когда лимит уже исчерпан,
                 # отрицательный room даёт отрицательную долю и «внутрь» попадают
                 # отрицательные токены
-                room = max(0.0, max_cap - acc)
-                frac = room / c if c > 0 else 1.0
-                add_tokens(within, r["tokens"], frac)
-                add_tokens(overflow, r["tokens"], 1.0 - frac)
-            acc += c
-        return within, overflow, acc
+                room = max(0.0, cap - accs[i])
+                if rem <= room + 1e-12:
+                    add_tokens(within[i], r["tokens"], (rem / c) if c > 0 else 1.0)
+                    accs[i] += rem
+                    rem = 0.0
+                    break
+                if room > 0:
+                    add_tokens(within[i], r["tokens"], room / c)
+                    accs[i] += room
+                    rem -= room
+            if rem > 1e-12:
+                add_tokens(overflow, r["tokens"], rem / c)
+            details.append((r, (rem / c) if c > 0 else 0.0, c))
+        return within, overflow, details
 
     def _peak_day(self, row):
         # день строки — по времени окна (окно может быть точечным)
         return datetime.fromtimestamp(row["window_end"], PEAK_TZ).date()
+
+    def _row_credits(self, row):
+        return self._calc.credits(row["tokens"], self._mult.for_model(row["model"]),
+                                  self._peak.share(self._peak_day(row),
+                                                   row["window_start"], row["window_end"]))
+
+
+def group_overflow(details, key_fn):
+    """Переполнение по группам (день, сессия): только та часть строк, которая не
+    влезла ни в один лимит каскада. Прежний расчёт токенов работает именно такими
+    группами, поэтому отчёт по дням и по сессии строится из этого разбора.
+
+    details — (строка, доля переполнения, кредиты) из OverflowLedger.split.
+    """
+    out = {}
+    for r, frac, _credits in details:
+        if frac is None or frac <= 0.0:
+            continue
+        k = key_fn(r)
+        out.setdefault(k, zero_tokens())
+        add_tokens(out[k], r["tokens"], frac)
+    return out
 
 
 # --- состояние ---------------------------------------------------------------
@@ -340,6 +464,24 @@ class PlanStateStore:
         return self._path
 
 
+def resolve_anchor(state, today, default_day=None):
+    """Якорь месяца: сохранённый, иначе дефолт. Возвращает (date, source).
+
+    Три ветви, каждая обязана называться в блоке:
+      saved            — пользователь установил свой день
+      default_derived  — дефолт, заданный настройкой навыка (DEFAULT_ANCHOR_DAY)
+      default          — день 1, когда дефолта нет
+    Сохранённый якорь всегда важнее дефолта.
+    """
+    raw = state.get("anchor_date") or state.get("anchor_day")
+    if raw:
+        return parse_anchor(raw), "saved"
+    if default_day is not None:
+        day = min(int(default_day), calendar.monthrange(today.year, today.month)[1])
+        return date(today.year, today.month, day), "default_derived"
+    return date(today.year, today.month, 1), "default"
+
+
 def parse_anchor(value):
     """Число 1-31 или дата YYYY-MM-DD -> date (день начала отсчёта месяца)."""
     if isinstance(value, (date, datetime)):
@@ -361,11 +503,13 @@ class TransitionNotifier:
 
     def message(self, previous, current):
         """None — перехода нет. Строка — сообщение о переполнении."""
-        if previous == current:
-            return None
         if current is None:
             return "План Max переполнен, переходим на пересчет токенов."
+        # состояние пустое (первый запуск) — отсчёт начинался с первого плана каскада,
+        # иначе первое же переполнение молча не сообщается
         if previous is None:
+            previous = self._registry.order()[0]
+        if previous == current:
             return None
         return "Превышен план %s, перешли на %s" % (previous.capitalize(), current.capitalize())
 
@@ -373,7 +517,8 @@ class TransitionNotifier:
 # --- доставляемый блок ---------------------------------------------------------
 class PlanReport:
     def __init__(self, window, cascade, calculator, multipliers, registry, peak_model,
-                 state=None, source=None):
+                 state=None, source=None, anchor_source="default", notifier=None,
+                 by_actual=False, mcp_note=None, store=None):
         self.window = window
         self.cascade = cascade
         self.calculator = calculator
@@ -382,6 +527,13 @@ class PlanReport:
         self.peak_model = peak_model
         self.state = state or {}
         self.source = source
+        self.anchor_source = anchor_source
+        self.notifier = notifier
+        self.by_actual = by_actual
+        self.mcp_note = mcp_note or ("MCP-вызовы (Web Search / Reader / Zread) не отслеживаются — "
+                                     "кредиты по инструментам в блок не включены")
+        self.store = store
+        self.degraded = None
 
     def first_line(self, credits):
         plan = self.cascade.current_plan(credits)
@@ -392,13 +544,24 @@ class PlanReport:
         return "Равно %.1f%% плана %s на Z.ai" % (step.pct, step.plan.capitalize())
 
     def rows(self):
-        return self.source.rows(self.window) if self.source is not None else []
+        if self.source is None:
+            self.degraded = "источник строк недоступен (dry-run)"
+            return []
+        try:
+            return self.source.rows(self.window)
+        except Exception as e:
+            # блок деградирует честно: заголовок и оговорка о выводе печатаются,
+            # кредиты не считаются, и блок это называет
+            self.degraded = str(e)
+            return []
 
     def credits(self, rows):
         total = 0.0
         for r in rows:
             day = datetime.fromtimestamp(r["window_end"], PEAK_TZ).date()
-            c = self.calculator.credits(r["tokens"], self.multipliers.for_model(r["model"]),
+            mult = (self.multipliers.for_model(r["model"]) if self.by_actual
+                    else self.multipliers.for_model(self.multipliers.fallback_model()))
+            c = self.calculator.credits(r["tokens"], mult,
                                         self.peak_model.share(day, r["window_start"], r["window_end"]))
             if c is not None:
                 total += c
@@ -412,23 +575,32 @@ class PlanReport:
         lines = [self.first_line(credits)]
         lines.append("Эквивалентный кодовый план z.ai (эквивалентная модель %s)"
                      % self.multipliers.fallback_model())
-        lines.append("Месячное окно: %s 00:00 -> %s 00:00 (%d дней), день начала отсчёта — %s"
+        lines.append("Месячное окно: %s 00:00 -> %s 00:00 (%d дней), день начала отсчёта — %s (%s)"
                      % (self.window.start.date(), self.window.end.date(), self.window.days(),
-                        self.window.anchor.day))
+                        self.window.anchor.day, self.anchor_source))
         if self.window.clamped:
             lines.append("Якорь %d-го числа в этом месяце нет — взято последнее число месяца "
                          "(это ограничение метода)" % self.window.anchor.day)
+        if self.degraded:
+            lines.append("Блок плана z.ai не посчитан: %s" % self.degraded)
+            lines.append("Месячный лимит выведен из недельного: %d x (%d/7) — на сайте публикуется "
+                         "только 5-часовой и недельный, месячного нет"
+                         % (self.registry.weekly(self.state.get("plan") or "light"), self.window.days()))
+            lines.append(self.mcp_note)
+            return lines
         if rows:
             tot = zero_tokens()
             for r in rows:
                 add_tokens(tot, r["tokens"])
-            m = self.multipliers.for_model(self.multipliers.fallback_model())
-            if credits is None:
-                credits = self.credits(rows)
-            lines.append("Кредиты за окно: %.1f (вход %.2fM x %.1f, кэш-вход %.2fM x %.2f, "
-                         "выход %.2fM x %.1f)" % (credits, tot["input"] / 1e6, m["input"],
-                                                   tot["cached"] / 1e6, m["cached"],
-                                                   tot["output"] / 1e6, m["output"]))
+            if self.by_actual:
+                lines.append("Кредиты за окно: %.1f (по мультипликаторам фактической модели каждой строки)"
+                             % credits)
+            else:
+                m = self.multipliers.for_model(self.multipliers.fallback_model())
+                lines.append("Кредиты за окно: %.1f (вход %.2fM x %.1f, кэш-вход %.2fM x %.2f, "
+                             "выход %.2fM x %.1f)" % (credits, tot["input"] / 1e6, m["input"],
+                                                       tot["cached"] / 1e6, m["cached"],
+                                                       tot["output"] / 1e6, m["output"]))
             for step in self.cascade.evaluate(credits):
                 lines.append("использовано %.1f%% %s плана (%.1f кредитов из месячного лимита %.1f)"
                              % (step.pct, step.plan.capitalize(), step.used, step.cap))
@@ -438,17 +610,31 @@ class PlanReport:
                      "только 5-часовой и недельный, месячного нет"
                      % (self.registry.weekly(self.cascade.current_plan(credits) or MAX_PLAN),
                         self.window.days()))
-        lines.append("Пик/офф-пик — интегральная оценка по дню (модель %s): пн-пт 4/24 часа, "
-                     "выходной — весь день вне пика; момент конкретного вызова не используется"
-                     % self.peak_model.name)
+        lines.append("Пик/офф-пик — " + self.peak_model.describe())
         point = sum(1 for r in rows if r["attribution"] in ("backfill", "first_seen"))
         if point:
             lines.append("Строк с точечной атрибуцией (backfill/first_seen): %d — их день определяется "
                          "по моменту last_seen, это оценка" % point)
+        n_unknown = self.source.unknown_count(self.window) if self.source is not None else 0
+        if n_unknown:
+            lines.append("В окне %d строк с незаписанным провайдером (plan unknown) — они не входят "
+                         "в оценку плана" % n_unknown)
+        n_anom = self.source.anomalies(self.window) if self.source is not None else 0
+        if n_anom:
+            lines.append("Anomaly-строки в окне: %d — они не входят в суммы (строка уменьшилась или "
+                         "исчезла между наблюдениями), но остаются в базе" % n_anom)
+        if self.source is not None:
+            n_before, tok_before = self.source.before_window(self.window)
+            if n_before:
+                lines.append("Строк базы ДО начала окна: %d (%.2fM токенов) — они относятся к "
+                             "предыдущему месячному окну и в оценку не входят" % (n_before, tok_before / 1e6))
         unknown = sorted({r["model"] for r in rows if not self.multipliers.known(r["model"])})
         if unknown:
             lines.append("Модели без опубликованных мультипликаторов: %s — посчитаны мультипликаторами "
                          "эквивалентной модели" % ", ".join(unknown))
-        lines.append("MCP-вызовы (Web Search / Reader / Zread) не отслеживаются — кредиты по "
-                     "инструментам в блок не включены")
+        msg = (self.notifier.message(self.state.get("plan"), self.cascade.current_plan(credits))
+               if self.notifier is not None else None)
+        if msg:
+            lines.append(msg)
+        lines.append(self.mcp_note)
         return lines

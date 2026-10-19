@@ -19,6 +19,34 @@ echo "  token-cost-daily 0 21 * * *,                script=token_cost_commit.py,
 echo "переменная TOKEN_COST_CHAT_ID — твой Telegram chat id (без неё блок «За текущую сессию»"
 echo "может относиться к чату автора навыка)."
 echo "Скрипты должны лежать в ~/.hermes/scripts/ (крон исполняет только оттуда)."
-echo "Блок плана z.ai: день начала отсчёта месяца по умолчанию — 1-е число; свой день"
-echo "  сохраняется в ~/.hermes/state/token_cost_plan.json:"
-echo "  python3 ~/.hermes/scripts/plan_usage.py --set-anchor <день или YYYY-MM-DD>"
+
+# выбор дня начала подписки — предлагается при установке с нуля
+if [ -t 0 ]; then
+  "$PY" - <<'EOF'
+import json, os, sys
+from datetime import date, timedelta
+
+state = os.path.expanduser("~/.hermes/state")
+os.makedirs(state, exist_ok=True)
+path = os.path.join(state, "token_cost_plan.json")
+yesterday = (date.today() - timedelta(days=1)).isoformat()
+print("День начала отсчёта месячного плана z.ai: число 1-31 или дата YYYY-MM-DD.")
+print("Enter — вчера (%s): так все данные, уже имеющиеся в базе, попадают в расчёт." % yesterday)
+raw = sys.stdin.readline().strip()
+if not raw:
+    value = yesterday
+else:
+    try:
+        value = date.fromisoformat(raw).isoformat() if len(raw) == 10 else min(int(raw), 31)
+    except ValueError:
+        sys.exit("не понял: нужен день 1-31 или дата YYYY-MM-DD")
+st = {"anchor_date": value, "anchor_source": "saved", "plan": "light", "model": "glm-5.3-flash"}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(st, f, ensure_ascii=False, indent=2)
+print("записано:", path, "->", st["anchor_date"])
+EOF
+else
+  echo "День начала отсчёта месячного плана (подписка): по умолчанию — 1-е число месяца;"
+  echo "  свой день сохраняется в ~/.hermes/state/token_cost_plan.json:"
+  echo "  python3 ~/.hermes/scripts/plan_usage.py --set-anchor <день или YYYY-MM-DD>"
+fi
