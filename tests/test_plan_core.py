@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""Тесты ядра блока плана (plan_core.py) — все ветви логики.
+
+Только stdlib, offline, Python 3.9+. Запуск: python3 tests/test_plan_core.py
+Никакого реального HOME: источник инкрементов — in-memory SQLite, состояние —
+временный файл.
+"""
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from datetime import date, datetime, timedelta, timezone
+from fractions import Fraction
+
+SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+sys.path.insert(0, SCRIPTS)
+
+import plan_core as P                                    # noqa: E402
+
+PEAK_TZ = P.PEAK_TZ
+INC_COLS = ("run_id", "run_at", "run_epoch", "window_start", "window_end", "session_id",
+           "model", "billing_provider", "billing_base_url", "billing_mode", "task",
+           "plan_class", "input_delta", "cache_delta", "output_delta", "attribution", "note")
+
+
+def ts(y, m, d, h, mi=0, tz=PEAK_TZ):
+    return datetime(y, m, d, h, mi, tzinfo=tz).timestamp()
+
+
+def row(model, plan_class, attribution, start, end, i=0, c=0, o=0):
+    return {"model": model, "plan_class": plan_class, "attribution": attribution,
+            "window_start": start, "window_end": end,
+            "tokens": {"input": i, "cached": c, "output": o}}
+
+
+def fake_db(rows):
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE increments(" + ", ".join(INC_COLS) + ")")
+    for n, r in enumerate(rows, 1):
+        con.execute("INSERT INTO increments VALUES(" + ",".join("?" * len(INC_COLS)) + ")",
+                    (n, "x", r["window_end"], r["window_start"], r["window_end"], "s1",
+                     r["model"], "zai", "https://api.z.ai", "", "chat", r["plan_class"],
+                     r["tokens"]["input"], r["tokens"]["cached"], r["tokens"]["output"],
+                     r["attribution"], ""))
+    con.commit()
+    return con
+
+
+# --- PeakModel ---------------------------------------------------------------
+class PeakModelBranches(unittest.TestCase):
+    def test_day_integral_weekday(self):
+        m = P.DayIntegralPeakModel()
+        # понедельник 19.10.2026
+        self.assertAlmostEqual(m.share(date(2026, 10, 19)), 4.0 / 24.0)
+
+    def test_day_integral_weekend_is_zero(self):
+        m = P.DayIntegralPeakModel()
+        self.assertEqual(m.share(date(2026, 10, 17)), 0.0)   # суббота
+        self.assertEqual(m.share(date(2026, 10, 18)), 0.0)   # воскресенье
+
+    def test_day_integral_ignores_window(self):
+        m = P.DayIntegralPeakModel()
+        self.assertAlmostEqual(m.share(date(2026, 10, 19), ts(2026, 10, 19, 3, 0), ts(2026, 10, 19, 4, 0)),
+                               4.0 / 24.0, places=6)
+
+    def test_window_model_full_peak(self):
+        m = P.WindowPeakModel()
+        self.assertAlmostEqual(m.share(date(2026, 10, 19), ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 16, 0)), 1.0)
+
+    def test_window_model_partial_peak(self):
+        m = P.WindowPeakModel()
+        self.assertAlmostEqual(m.share(date(2026, 10, 19), ts(2026, 10, 19, 13, 0), ts(2026, 10, 19, 15, 0)), 0.5)
+
+    def test_window_model_weekend(self):
+        m = P.WindowPeakModel()
+        self.assertEqual(m.share(date(2026, 10, 18), ts(2026, 10, 18, 15, 0), ts(2026, 10, 18, 16, 0)), 0.0)
+
+    def test_window_model_point_window_uses_moment(self):
+        m = P.WindowPeakModel()
+        self.assertEqual(m.share(date(2026, 10, 19), ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 0)), 1.0)
+        self.assertEqual(m.share(date(2026, 10, 18), ts(2026, 10, 18, 15, 0), ts(2026, 10, 18, 15, 0)), 0.0)
+
+    def test_window_model_falls_back_to_day_integral_without_window(self):
+        m = P.WindowPeakModel()
+        self.assertAlmostEqual(m.share(date(2026, 10, 19)), 4.0 / 24.0)
+        self.assertEqual(m.share(date(2026, 10, 17)), 0.0)
+
+    def test_window_model_guard_too_long(self):
+        m = P.WindowPeakModel()
+        start = ts(2026, 1, 1, 0, 0)
+        end = start + 4001 * 86400.0
+        self.assertIsNone(m.share(date(2026, 1, 1), start, end))
+
+    def test_interface_is_abstract(self):
+        with self.assertRaises(TypeError):
+            P.PeakModel()
+        with self.assertRaises(TypeError):
+            P.CreditCalculator()
+        with self.assertRaises(TypeError):
+            P.IncrementSource()
+
+
+# --- CreditCalculator --------------------------------------------------------
+class CreditCalculatorBranches(unittest.TestCase):
+    def setUp(self):
+        self.calc = P.StandardCreditCalculator()
+        self.mult = P.MULTIPLIERS["glm-5.3-flash"]
+
+    def test_peak_formula(self):
+        toks = {"input": 5000, "cached": 95000, "output": 2000}
+        self.assertAlmostEqual(self.calc.credits(toks, self.mult, 1.0), 8.07, places=6)
+
+    def test_offpeak_is_half(self):
+        toks = {"input": 5000, "cached": 95000, "output": 2000}
+        self.assertAlmostEqual(self.calc.credits(toks, self.mult, 0.0), 4.035, places=6)
+
+    def test_blended_day_integral_share(self):
+        # доля пика 1/6 -> коэффициент 1/6 + 5/6 * 0.5 = 7/12
+        toks = {"input": 10000, "cached": 0, "output": 0}
+        self.assertAlmostEqual(self.calc.credits(toks, self.mult, 1.0 / 6.0), 2.3 * 7.0 / 12.0, places=6)
+
+    def test_none_share_returns_none(self):
+        toks = {"input": 10000, "cached": 0, "output": 0}
+        self.assertIsNone(self.calc.credits(toks, self.mult, None))
+
+    def test_glm53_multipliers(self):
+        toks = {"input": 10000, "cached": 0, "output": 0}
+        self.assertAlmostEqual(self.calc.credits(toks, P.MULTIPLIERS["glm-5.3"], 1.0), 6.9, places=6)
+
+
+# --- MultiplierRegistry ------------------------------------------------------
+class MultiplierRegistryBranches(unittest.TestCase):
+    def test_known_model(self):
+        r = P.MultiplierRegistry()
+        self.assertTrue(r.known("glm-5.3-flash"))
+        self.assertEqual(r.for_model("glm-5.3")["input"], 6.9)
+
+    def test_unknown_model_uses_fallback_and_is_named(self):
+        r = P.MultiplierRegistry()
+        self.assertFalse(r.known("glm-4.7"))
+        self.assertEqual(r.for_model("glm-4.7"), r.for_model(P.EQUIV_MODEL))
+        self.assertEqual(r.fallback_model(), P.EQUIV_MODEL)
+
+    def test_case_insensitive(self):
+        r = P.MultiplierRegistry()
+        self.assertEqual(r.for_model("GLM-5.3-Flash"), r.for_model("glm-5.3-flash"))
+
+    def test_empty_model_name_uses_fallback(self):
+        r = P.MultiplierRegistry()
+        self.assertEqual(r.for_model(""), r.for_model(P.EQUIV_MODEL))
+
+
+# --- PlanRegistry ------------------------------------------------------------
+class PlanRegistryBranches(unittest.TestCase):
+    def test_order_and_limits(self):
+        r = P.PlanRegistry()
+        self.assertEqual(r.order(), ["light", "pro", "max"])
+        self.assertEqual((r.weekly("light"), r.weekly("pro"), r.weekly("max")), (10000, 60000, 140000))
+        self.assertEqual((r.five_hour("light"), r.five_hour("pro"), r.five_hour("max")), (2000, 12000, 28000))
+
+    def test_monthly_cap_is_derived_from_weekly(self):
+        r = P.PlanRegistry()
+        self.assertAlmostEqual(r.monthly_cap("light", 31), 10000 * 31 / 7.0, places=6)
+        self.assertAlmostEqual(r.monthly_cap("pro", 30), 60000 * 30 / 7.0, places=6)
+        self.assertAlmostEqual(r.monthly_cap("max", 28), 140000 * 28 / 7.0, places=6)
+
+
+# --- MonthWindow --------------------------------------------------------------
+class MonthWindowBranches(unittest.TestCase):
+    def test_normal_window(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        self.assertEqual(w.days(), 31)
+        self.assertEqual(w.start.date(), date(2026, 10, 19))
+        self.assertEqual(w.end.date(), date(2026, 11, 19))
+        self.assertFalse(w.clamped)
+
+    def test_window_starts_at_midnight(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        self.assertEqual((w.start.hour, w.start.minute), (0, 0))
+
+    def test_clamped_when_anchor_day_missing(self):
+        w = P.MonthWindow(date(2026, 1, 31))
+        self.assertTrue(w.clamped)
+        self.assertEqual(w.end.date(), date(2026, 2, 28))
+        self.assertEqual(w.days(), 28)
+
+    def test_contains_boundaries(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        self.assertTrue(w.contains(w.start.timestamp()))          # начало включительно
+        self.assertFalse(w.contains(w.end.timestamp()))           # конец исключительно
+        self.assertFalse(w.contains(w.start.timestamp() - 1))
+
+    def test_day_of_uses_peak_timezone(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        # 23:00 UTC того же дня = 07:00 следующего дня SGT
+        self.assertEqual(w.day_of(ts(2026, 10, 19, 23, 0, tz=timezone.utc)), date(2026, 10, 20))
+
+    def test_accepts_datetime(self):
+        w = P.MonthWindow(datetime(2026, 10, 19, 13, 0, tzinfo=PEAK_TZ))
+        self.assertEqual(w.anchor, date(2026, 10, 19))
+        self.assertEqual((w.start.hour, w.start.minute), (0, 0))
+
+
+# --- IncrementSource ---------------------------------------------------------
+class IncrementSourceBranches(unittest.TestCase):
+    def test_inmemory_source_filters_window(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11)),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 18, 10), ts(2026, 10, 18, 11))]
+        got = P.InMemoryIncrementSource(rows).rows(w)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["window_end"], ts(2026, 10, 20, 11))
+
+    def test_sqlite_source_excludes_anomaly_and_local(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 100),
+                row("glm-5.3-flash", "zai_plan_by_rule", "anomaly", ts(2026, 10, 20, 11), ts(2026, 10, 20, 12), -50),
+                row("qwen", "local", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 5000),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 18, 10), ts(2026, 10, 18, 11), 700)]
+        con = fake_db(rows)
+        src = P.SqliteIncrementSource(lambda: con)
+        got = src.rows(w)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["tokens"]["input"], 100)
+
+    def test_sqlite_source_accepts_zai_paid(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        con = fake_db([row("glm-5.3-flash", "zai_paid", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 10)])
+        self.assertEqual(len(P.SqliteIncrementSource(lambda: con).rows(w)), 1)
+
+    def test_empty_window_returns_empty(self):
+        w = P.MonthWindow(date(2026, 10, 19))
+        con = fake_db([row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 12, 25, 10), ts(2026, 12, 25, 11))])
+        self.assertEqual(P.SqliteIncrementSource(lambda: con).rows(w), [])
+
+
+# --- PlanCascade --------------------------------------------------------------
+class PlanCascadeBranches(unittest.TestCase):
+    def setUp(self):
+        self.w = P.MonthWindow(date(2026, 10, 1))
+        self.c = P.PlanCascade(P.PlanRegistry(), self.w)
+
+    def test_under_light_cap(self):
+        steps = self.c.evaluate(1000.0)
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0].plan, "light")
+        self.assertAlmostEqual(steps[0].pct, 1000 / (10000 * 31 / 7.0) * 100.0, places=6)
+        self.assertEqual(self.c.current_plan(1000.0), "light")
+
+    def test_zero_credits(self):
+        steps = self.c.evaluate(0.0)
+        self.assertEqual(len(steps), 1)
+        self.assertAlmostEqual(steps[0].pct, 0.0)
+        self.assertEqual(self.c.current_plan(0.0), "light")
+
+    def test_exactly_at_light_cap(self):
+        cap = 10000 * 31 / 7.0
+        steps = self.c.evaluate(cap)
+        self.assertEqual(len(steps), 1)
+        self.assertAlmostEqual(steps[0].pct, 100.0)
+        self.assertEqual(self.c.current_plan(cap), "light")
+
+    def test_overflow_light_to_pro(self):
+        steps = self.c.evaluate(45000.0)
+        self.assertEqual([s.plan for s in steps], ["light", "pro"])
+        self.assertAlmostEqual(steps[0].pct, 100.0)
+        self.assertAlmostEqual(steps[1].pct, (45000 - 10000 * 31 / 7.0) / (60000 * 31 / 7.0) * 100.0, places=6)
+        self.assertEqual(self.c.current_plan(45000.0), "pro")
+
+    def test_overflow_pro_to_max(self):
+        steps = self.c.evaluate(400000.0)
+        self.assertEqual([s.plan for s in steps], ["light", "pro", "max"])
+        self.assertAlmostEqual(steps[0].pct, 100.0)
+        self.assertAlmostEqual(steps[1].pct, 100.0)
+        rem = 400000 - 10000 * 31 / 7.0 - 60000 * 31 / 7.0
+        self.assertAlmostEqual(steps[2].pct, rem / (140000 * 31 / 7.0) * 100.0, places=6)
+        self.assertEqual(self.c.current_plan(400000.0), "max")
+
+    def test_overflow_max_means_no_plan_left(self):
+        steps = self.c.evaluate(1000000.0)
+        self.assertEqual(len(steps), 3)
+        self.assertTrue(all(s.pct >= 100.0 for s in steps))
+        self.assertIsNone(self.c.current_plan(1000000.0))
+
+
+# --- OverflowLedger -----------------------------------------------------------
+class OverflowLedgerBranches(unittest.TestCase):
+    def setUp(self):
+        self.peak = P.DayIntegralPeakModel()
+        self.calc = P.StandardCreditCalculator()
+        self.mult = P.MultiplierRegistry()
+        self.ledger = P.OverflowLedger(self.calc, self.mult, self.peak)
+
+    def test_no_overflow(self):
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000)]
+        within, overflow, acc = self.ledger.split(rows, 100.0)
+        self.assertAlmostEqual(within["input"], 10000)
+        self.assertAlmostEqual(overflow["input"], 0.0)
+        # понедельник: доля пика 1/6 -> коэффициент 7/12
+        self.assertAlmostEqual(acc, 2.3 * 7.0 / 12.0, places=6)
+
+    def test_partial_row_split(self):
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 11), ts(2026, 10, 19, 12), 10000)]
+        within, overflow, acc = self.ledger.split(rows, 1.0)
+        # ожидание считается дробями, не вручную: c = 2.3 x 7/12 = 161/120
+        c = Fraction(23, 10) * Fraction(7, 12)
+        frac_first = Fraction(1, 1) / c            # доля первой строки, которая ещё влезла
+        self.assertAlmostEqual(within["input"], float(10000 * frac_first), places=6)
+        # вторая строка: лимит уже исчерпан, room = 0 -> вся вторая строка в переполнении
+        self.assertAlmostEqual(overflow["input"], float(10000 * (1 - frac_first)) + 10000, places=6)
+
+    def test_room_never_negative_when_cap_already_exceeded(self):
+        # если лимит уже исчерпан, «внутрь» не должны попадать отрицательные токены
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000)]
+        within, overflow, _ = self.ledger.split(rows, 0.5)
+        self.assertGreaterEqual(within["input"], 0.0)
+        self.assertAlmostEqual(within["input"] + overflow["input"], 10000, places=6)
+
+    def test_chronological_order_matters(self):
+        # строка, пришедшая позже по времени, не должна «съедать» лимит у более ранней
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 11), ts(2026, 10, 19, 12), 10000),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000)]
+        within, overflow, _ = self.ledger.split(rows, 1.0)
+        c = Fraction(23, 10) * Fraction(7, 12)
+        first_overflow = 10000 * (1 - Fraction(1, 1) / c)
+        self.assertAlmostEqual(overflow["input"], float(first_overflow) + 10000, places=6)
+
+    def test_zero_credit_row_does_not_divide_by_zero(self):
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 0),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 11), ts(2026, 10, 19, 12), 10000)]
+        within, overflow, acc = self.ledger.split(rows, 1.0)
+        c = Fraction(23, 10) * Fraction(7, 12)
+        self.assertAlmostEqual(overflow["input"], float(10000 * (1 - Fraction(1, 1) / c)), places=6)
+
+    def test_weekend_row_uses_offpeak(self):
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 17, 10), ts(2026, 10, 17, 11), 10000)]
+        within, _, acc = self.ledger.split(rows, 100.0)
+        self.assertAlmostEqual(acc, 2.3 * 0.5, places=6)
+
+
+# --- состояние ---------------------------------------------------------------
+class PlanStateStoreBranches(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="plan-state-")
+        self.store = P.PlanStateStore(os.path.join(self.home, "state", "token_cost_plan.json"))
+
+    def test_load_missing_returns_empty(self):
+        self.assertEqual(self.store.load(), {})
+
+    def test_save_creates_dir_and_roundtrips(self):
+        self.store.save({"anchor_date": "2026-10-19", "plan": "light"})
+        self.assertTrue(os.path.exists(self.store.path()))
+        st = self.store.load()
+        self.assertEqual(st["anchor_date"], "2026-10-19")
+        self.assertIn("saved_at", st)
+
+    def test_broken_json_degrades_to_empty(self):
+        os.makedirs(os.path.dirname(self.store.path()), exist_ok=True)
+        with open(self.store.path(), "w") as f:
+            f.write("{ not json")
+        self.assertEqual(self.store.load(), {})
+
+
+class ParseAnchorBranches(unittest.TestCase):
+    def test_int_day(self):
+        d = P.parse_anchor("15")
+        self.assertEqual(d.day, 15)
+
+    def test_full_date(self):
+        self.assertEqual(P.parse_anchor("2026-10-19"), date(2026, 10, 19))
+
+    def test_invalid_day_raises(self):
+        with self.assertRaises(ValueError):
+            P.parse_anchor("32")
+        with self.assertRaises(ValueError):
+            P.parse_anchor("0")
+
+    def test_day_clamped_to_current_month_length(self):
+        d = P.parse_anchor("31")
+        self.assertLessEqual(d.day, 31)
+
+    def test_date_object_passes_through(self):
+        self.assertEqual(P.parse_anchor(date(2026, 10, 19)), date(2026, 10, 19))
+
+
+# --- переход плана -------------------------------------------------------------
+class TransitionNotifierBranches(unittest.TestCase):
+    def setUp(self):
+        self.n = P.TransitionNotifier(P.PlanRegistry())
+
+    def test_no_transition(self):
+        self.assertIsNone(self.n.message("light", "light"))
+        self.assertIsNone(self.n.message(None, None))
+
+    def test_light_to_pro(self):
+        self.assertEqual(self.n.message("light", "pro"), "Превышен план Light, перешли на Pro")
+
+    def test_pro_to_max(self):
+        self.assertEqual(self.n.message("pro", "max"), "Превышен план Pro, перешли на Max")
+
+    def test_max_overflow_message(self):
+        self.assertEqual(self.n.message("max", None), "План Max переполнен, переходим на пересчет токенов.")
+
+    def test_first_plan_no_message(self):
+        self.assertIsNone(self.n.message(None, "light"))
+
+
+# --- доставляемый блок ---------------------------------------------------------
+class PlanReportBranches(unittest.TestCase):
+    def setUp(self):
+        self.w = P.MonthWindow(date(2026, 10, 19))
+        self.cascade = P.PlanCascade(P.PlanRegistry(), self.w)
+        self.report = P.PlanReport(self.w, self.cascade, P.StandardCreditCalculator(),
+                                   P.MultiplierRegistry(), P.PlanRegistry(),
+                                   P.DayIntegralPeakModel(),
+                                   source=P.InMemoryIncrementSource([]))
+
+    def test_first_line_format(self):
+        # 1000 / (10000 x 31/7) = 2.258% -> "%.1f" = 2.3
+        self.assertEqual(self.report.first_line(1000.0), "Равно 2.3% плана Light на Z.ai")
+
+    def test_first_line_after_overflow_is_next_plan(self):
+        self.assertEqual(self.report.first_line(45000.0),
+                         "Равно %.1f%% плана Pro на Z.ai" % ((45000 - 10000 * 31 / 7.0) / (60000 * 31 / 7.0) * 100.0))
+
+    def test_first_line_when_max_overflowed(self):
+        self.assertEqual(self.report.first_line(1000000.0), "Равно 100.0% плана Max на Z.ai")
+
+    def test_block_without_rows_says_so(self):
+        out = "\n".join(self.report.build())
+        self.assertIn("Строк плана в окне нет", out)
+
+    def test_block_with_rows(self):
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000)]
+        out = "\n".join(self.report.build(rows))
+        self.assertIn("Равно", out.splitlines()[0])
+        self.assertIn("использовано", out)
+        self.assertIn("Light плана", out)
+        self.assertIn("только 5-часовой и недельный", out)
+        self.assertIn("интегральная оценка по дню", out)
+        self.assertIn("MCP-вызовы", out)
+
+    def test_point_rows_flagged_as_estimate(self):
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "backfill", ts(2026, 10, 19, 10), ts(2026, 10, 19, 10), 10000)]
+        out = "\n".join(self.report.build(rows))
+        self.assertIn("точечной атрибуцией", out)
+        self.assertIn("оценка", out)
+
+    def test_unknown_model_named(self):
+        rows = [row("glm-4.7", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000)]
+        out = "\n".join(self.report.build(rows))
+        self.assertIn("без опубликованных мультипликаторов", out)
+        self.assertIn("glm-4.7", out)
+
+    def test_clamped_anchor_named(self):
+        w = P.MonthWindow(date(2026, 1, 31))
+        r = P.PlanReport(w, P.PlanCascade(P.PlanRegistry(), w), P.StandardCreditCalculator(),
+                         P.MultiplierRegistry(), P.PlanRegistry(), P.DayIntegralPeakModel(),
+                         source=P.InMemoryIncrementSource([]))
+        out = "\n".join(r.build())
+        self.assertIn("ограничение метода", out)
+
+    def test_window_line_shows_midnight(self):
+        out = "\n".join(self.report.build())
+        self.assertIn("2026-10-19 00:00 -> 2026-11-19 00:00", out)
+        self.assertIn("день начала отсчёта — 19", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
