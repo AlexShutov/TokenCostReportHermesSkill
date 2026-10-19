@@ -19,3 +19,6 @@ echo "  token-cost-daily 0 21 * * *,                script=token_cost_commit.py,
 echo "переменная TOKEN_COST_CHAT_ID — твой Telegram chat id (без неё блок «За текущую сессию»"
 echo "может относиться к чату автора навыка)."
 echo "Скрипты должны лежать в ~/.hermes/scripts/ (крон исполняет только оттуда)."
+echo "Блок плана z.ai: день начала отсчёта месяца по умолчанию — 1-е число; свой день"
+echo "  сохраняется в ~/.hermes/state/token_cost_plan.json:"
+echo "  python3 ~/.hermes/scripts/plan_usage.py --set-anchor <день или YYYY-MM-DD>"

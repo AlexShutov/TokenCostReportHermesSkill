@@ -90,8 +90,10 @@ def main():
     for f in os.listdir(os.path.join(skill, "scripts")):
         if f.endswith(".py"):
             shutil.copy(os.path.join(skill, "scripts", f), os.path.join(scripts, f))
-    check("все скрипты скопированы", len([f for f in os.listdir(scripts) if f.endswith(".py")]) == 4,
-          str(sorted(os.listdir(scripts))))
+    src_scripts = sorted(f for f in os.listdir(os.path.join(skill, "scripts")) if f.endswith(".py"))
+    copied = sorted(f for f in os.listdir(scripts) if f.endswith(".py"))
+    check("все скрипты скопированы", copied == src_scripts,
+          f"{copied} != {src_scripts}")
 
     # 4. свежий Hermes у коллеги: source-таблица
     make_source_db(os.path.join(HOME, ".hermes", "state.db"))
