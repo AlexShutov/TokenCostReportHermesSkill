@@ -432,6 +432,17 @@ def main():
         lines.append(f"  отдельно — оплаченные z.ai (реально списанные деньги, это не план): "
                      f"{zai_paid/1e6:.2f}M токенов")
 
+    # эквивалентный кодовый план z.ai: месячное окно по логике кредитов z.ai
+    # (формула и мультипликаторы — docs.z.ai/devpack/overview; месячный лимит выводится
+    # из недельного, на сайте его нет). Каскад Light -> Pro -> Max.
+    try:
+        import plan_usage as P
+        st = P.default_state()
+        lines += ["", P.block(st["anchor_day"], datetime.now(P.PEAK_TZ), st["model"],
+                              by_actual=False, plan=st["plan"], con=con_db)]
+    except Exception as e:
+        lines.append("Блок плана z.ai не посчитан: %s" % e)
+
     # разбивка по дням — сумма инкрементов по временным окнам из базы
     if con_db is not None:
         rows = T.daily(con_db, "local", 4)

@@ -37,7 +37,7 @@ class Case(unittest.TestCase):
         self.home = tempfile.mkdtemp(prefix="tcr-test-")
         os.environ["HOME"] = self.home
         # пути вычислены при импорте модулей — перезагружаем их в новом HOME
-        for name in ("token_cost_db", "token_cost"):
+        for name in ("token_cost_db", "token_cost", "plan_usage"):
             sys.modules.pop(name, None)
         import token_cost_db as T
         import token_cost as C
@@ -235,6 +235,27 @@ class Report(Case):
         self.assertIn("оплаченные", out, f"блок z.ai не различает план и оплату: {out}")
         self.assertIn("Не учтено (z.ai coding plan): 2.50M", out, out)
         self.assertIn("1.20M", out, out)
+
+    def test_report_includes_plan_block(self):
+        out = self.capture([])
+        self.assertIn("Эквивалентный кодовый план z.ai", out, out)
+        self.assertIn("использовано", out, out)
+        self.assertIn("Light плана", out, out)
+        self.assertIn("месячного лимита", out, out)
+        # месячного лимита на сайте нет — блок обязан называть, что он выведен
+        self.assertIn("только 5-часовой и недельный", out, out)
+        self.assertIn("MCP-вызовы", out, out)
+
+    def test_dry_run_plan_block_writes_no_state(self):
+        out = self.capture(["--dry-run"])
+        self.assertIn("Эквивалентный кодовый план z.ai", out, out)
+        # dry-run не создаёт базу: блок обязан честно назвать, что кредиты не считались,
+        # и всё равно печатать заголовок и оговорку о выводе месячного лимита
+        self.assertIn("не посчитан", out, out)
+        self.assertIn("только 5-часовой и недельный", out, out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".hermes", "state",
+                                                     "token_cost_plan.json")),
+                         "dry-run создал файл состояния плана")
 
     def test_hours_line_not_mislabelled_without_commit_run(self):
         out = self.capture([])

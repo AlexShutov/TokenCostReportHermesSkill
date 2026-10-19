@@ -160,12 +160,16 @@ def main():
     con.close()
     check("исчезнувшая строка записана как anomaly", after > before, f"{before} -> {after}")
     check("anomaly показана в отчёте", "Anomaly-строки" in out)
+    check("блок плана z.ai в отчёте на чистой копии", "Эквивалентный кодовый план z.ai" in out,
+          "строка 'использовано X% Y плана' не печатается")
+    check("блок плана называет, что месячный лимит выведен", "только 5-часовой и недельный" in out, out[-400:])
 
     # 10. тесты навыка на чистой копии
-    r = subprocess.run([PY, os.path.join(skill, "tests", "test_token_cost.py")],
-                       capture_output=True, text=True, env={**os.environ, "HOME": HOME}, timeout=300)
-    check("тесты навыка на чистой копии", r.returncode == 0,
-          (r.stderr.strip().splitlines() or [""])[-1][:120])
+    for tf in ("test_token_cost.py", "test_plan_usage.py"):
+        r = subprocess.run([PY, os.path.join(skill, "tests", tf)],
+                           capture_output=True, text=True, env={**os.environ, "HOME": HOME}, timeout=300)
+        check(f"тесты навыка на чистой копии ({tf})", r.returncode == 0,
+              (r.stderr.strip().splitlines() or [""])[-1][:120])
 
     print("\n=== отчёт ===")
     passed = sum(1 for _, ok, _ in RESULTS if ok)
