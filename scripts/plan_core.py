@@ -327,11 +327,13 @@ class SqliteIncrementSource(IncrementSource):
     def gaps(self, window):
         con = self._conn_factory()
         try:
-            r = con.execute(
+            ph = ",".join("?" * len(self._plan_classes))
+            cur = con.execute(
                 "SELECT COUNT(*), COALESCE(SUM(input_delta),0), COALESCE(SUM(cache_delta),0), "
                 "COALESCE(SUM(output_delta),0) FROM increments WHERE attribution='gap' "
-                "AND window_end>=? AND window_start<=?",
-                (window.start.timestamp(), window.end.timestamp())).fetchone()
+                "AND plan_class IN (" + ph + ") AND window_end>=? AND window_start<=?",
+                list(self._plan_classes) + [window.start.timestamp(), window.end.timestamp()])
+            r = cur.fetchone()
             return (r[0], {"input": r[1], "cached": r[2], "output": r[3]})
         finally:
             con.close()

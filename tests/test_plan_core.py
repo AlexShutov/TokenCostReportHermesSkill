@@ -375,6 +375,18 @@ class SourceBranches(unittest.TestCase):
     def setUp(self):
         self.window = P.MonthWindow(date(2026, 10, 19))
 
+    def test_local_gap_not_counted_by_db_path(self):
+        """Оценка плана считает только плановые строки: без фильтра по плану в счёт
+        выбрасываемых интервалов попадали локальные. Замер: локальный gap 50000 —
+        путь базы называл его как интервал плана."""
+        import token_cost_db as T
+        rows = [row("qwen", "local", "gap", ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 50000)]
+        con = fake_db(rows)
+        n, tok = P.SqliteIncrementSource(lambda: con).gaps(self.window)
+        self.assertEqual(n, 0, "локальный интервал посчитан как интервал плана")
+        self.assertEqual(sum(tok.values()), 0)
+        con.close()
+
     def test_single_definition_of_excluded_rows_in_both_paths(self):
         """Одно определение исключённых атрибуций для обоих путей: раньше путь ядра
         имел своё условие (только anomaly), и выбрасываемый интервал попадал в
