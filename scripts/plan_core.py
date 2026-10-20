@@ -476,7 +476,12 @@ def resolve_anchor(state, today, default_day=None):
     """
     raw = state.get("anchor_date") or state.get("anchor_day")
     if raw:
-        return parse_anchor(raw, today), "saved"
+        d = parse_anchor(raw, today)
+        # исходный запрос сохраняется отдельно: после корректировки дата уже
+        # «правильная», и блок не смог бы назвать, что день был скорректирован
+        req = state.get("anchor_requested") or raw
+        src = "saved" + (" (clamped)" if clamped(req, d) else "")
+        return d, src
     if default_day is not None:
         day = min(int(default_day), calendar.monthrange(today.year, today.month)[1])
         return date(today.year, today.month, day), "default_derived"
@@ -492,16 +497,40 @@ def parse_anchor(value, today=None):
     if isinstance(value, (date, datetime)):
         return value if isinstance(value, date) else value.date()
     v = str(value).strip()
+    usage = "день начала отсчёта — число 1-31 или дата YYYY-MM-DD"
     if len(v) == 10 and v[4] == "-" and v[7] == "-":
-        y, m, d = int(v[:4]), int(v[5:7]), int(v[8:10])
+        try:
+            y, m, d = int(v[:4]), int(v[5:7]), int(v[8:10])
+        except ValueError:
+            raise ValueError(usage)
         if not 1 <= m <= 12:
             raise ValueError("месяц начала отсчёта — 1-12")
         return date(y, m, min(d, calendar.monthrange(y, m)[1]))
-    d = int(v)
+    try:
+        d = int(v)
+    except ValueError:
+        raise ValueError(usage)
     if not 1 <= d <= 31:
-        raise ValueError("день начала отсчёта — число 1-31 или дата YYYY-MM-DD")
+        raise ValueError(usage)
     ref = today or datetime.now(PEAK_TZ).date()
     return date(ref.year, ref.month, min(d, calendar.monthrange(ref.year, ref.month)[1]))
+
+
+def clamped(value, resolved):
+    """Числовой якорь не может указать день, которого в месяце нет — навык берёт
+    последний доступный. Это приближение, и оно обязано называться в блоке."""
+    if isinstance(value, (date, datetime)):
+        return False
+    v = str(value).strip()
+    if len(v) == 10 and v[4] == "-" and v[7] == "-":
+        try:
+            return resolved.day != int(v[8:10])
+        except ValueError:
+            return False
+    try:
+        return resolved.day != int(v)
+    except ValueError:
+        return False
 
 
 # --- переход плана -------------------------------------------------------------
@@ -591,6 +620,9 @@ class PlanReport:
         lines.append("Месячное окно: %s 00:00 -> %s 00:00 (%d дней), день начала отсчёта — %s (%s)"
                      % (self.window.start.date(), self.window.end.date(), self.window.days(),
                         self.window.anchor.day, self.anchor_source))
+        if "clamped" in self.anchor_source:
+            lines.append("Якорь скорректирован: запрошенного числа в этом месяце нет, взят последний "
+                         "доступный день (%d) — это ограничение метода" % self.window.anchor.day)
         if self.window.clamped:
             lines.append("Якорь %d-го числа в этом месяце нет — взято последнее число месяца "
                          "(это ограничение метода)" % self.window.anchor.day)

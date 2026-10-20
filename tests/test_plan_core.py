@@ -475,7 +475,7 @@ class ParseAnchorBranches(unittest.TestCase):
         и --month даёт окно другого месяца."""
         d, src = P.resolve_anchor({"anchor_day": "31"}, date(2026, 2, 10), None)
         self.assertEqual(d, date(2026, 2, 28), f"якорь взят из фактического сегодня: {d}")
-        self.assertEqual(src, "saved")
+        self.assertEqual(src, "saved (clamped)", f"корректировка дня не названа в источнике: {src}")
 
     def test_full_date_with_day_missing_in_that_month_is_clamped(self):
         self.assertEqual(P.parse_anchor("2026-02-31", date(2026, 2, 10)), date(2026, 2, 28))

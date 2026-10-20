@@ -78,6 +78,7 @@ def main(argv=None):
             print(str(e), file=sys.stderr)
             return 2
         state["anchor_date"] = anchor.isoformat()
+        state["anchor_requested"] = raw
         state["anchor_source"] = "saved"
         if not dry:
             store.save(state)
