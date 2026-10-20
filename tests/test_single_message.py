@@ -126,17 +126,17 @@ class Delivery(Case):
         super().setUp()
         import importlib
         import token_cost as C
-        # пути решаются при импорте: без перезагрузки модуль остаётся с HOME предыдущего
-        # теста, и патч main() из одного теста утекает в следующий
-        importlib.reload(C)
         import token_cost_db as T
+        # База этого теста: базовый setUp не меняет HOME, и тест читал чужую базу —
+        # в прогоне чистой установки это HOME коллеги с рядами предыдущих проверок,
+        # где было переполнение Max, которого в тесте быть не должно. HOME ставится
+        # ДО перезагрузки: пути решаются при импорте.
+        os.environ["HOME"] = self.home
+        importlib.reload(C)
         importlib.reload(T)
         self.C, self.T = C, T
-        # пути решаются при импорте: без перезагрузки тест читает базу того HOME,
-        # где модуль был импортирован впервые (в прогоне чистой установки это HOME
-        # коллеги с рядами предыдущих проверок — тест ловил переполнение Max,
-        # которого в нём быть не должно)
         C.conn = lambda: self.fake_source()
+        T.src_connect = lambda: self.fake_source()
         C.resolve_session = lambda c: "s1"
         C.fetch_prices = lambda: (None, "тест без сети")
         C.fetch_rate = lambda: (None, "тест без сети")
