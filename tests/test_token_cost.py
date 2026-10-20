@@ -440,6 +440,52 @@ class Report(Case):
         self.assertEqual(len(out.splitlines()), 2, f"сообщение без базы не вышло: {out!r}")
         self.assertIn("database is locked", log, f"деградация базы не названа в логе: {log!r}")
 
+    def test_manual_run_does_not_touch_the_network(self):
+        """Баг был: ручной запуск каждый раз ходил на сайт за ценами (замер 0.619 с) —
+        по правилу сеть трогается только на запланированном запуске 21:00, ручной читает
+        сохранённые цены. Тест считает фактические обращения, а не читает исходник."""
+        net = []
+        self.C.conn = lambda: fake_source(self.ROWS)
+        self.T.src_connect = lambda: fake_source(self.ROWS)
+        self.C.resolve_session = lambda c: "s1"
+        self.C.fetch_prices = lambda: (net.append("prices"), (None, "тест без сети"))[1]
+        self.C.fetch_rate = lambda: (net.append("rate"), (None, "тест без сети"))[1]
+        sys.argv = ["token_cost.py"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.C.main()
+        self.assertEqual(net, [], f"ручной запуск обратился к сети: {net}")
+        sys.argv = ["token_cost.py", "--commit"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.C.main()
+        self.assertEqual(net, ["prices", "rate"],
+                         f"запуск 21:00 обязан обновить цены и курс: {net}")
+
+    def test_tick_does_not_touch_the_network(self):
+        net = []
+        self.C.conn = lambda: fake_source(self.ROWS)
+        self.T.src_connect = lambda: fake_source(self.ROWS)
+        self.C.resolve_session = lambda c: "s1"
+        self.C.fetch_prices = lambda: (net.append("prices"), (None, ""))[1]
+        self.C.fetch_rate = lambda: (net.append("rate"), (None, ""))[1]
+        sys.argv = ["token_cost.py", "--tick"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.C.main()
+        self.assertEqual(net, [], f"тик обратился к сети: {net}")
+
+    def test_calculation_is_a_fraction_of_a_second(self):
+        """Правило пользователя: расчёт — доля секунды. Замер без сети и без LLM."""
+        self.C.conn = lambda: fake_source(self.ROWS)
+        self.T.src_connect = lambda: fake_source(self.ROWS)
+        self.C.resolve_session = lambda c: "s1"
+        self.C.fetch_prices = lambda: (None, "тест без сети")
+        self.C.fetch_rate = lambda: (None, "тест без сети")
+        sys.argv = ["token_cost.py"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            t0 = time.time()
+            self.C.main()
+        took = time.time() - t0
+        self.assertLess(took, 0.5, f"расчёт занимает {took:.3f} с — правило требует долю секунды")
+
     def test_commit_writes_snapshot(self):
         """Баг был: блок записи снимка стоял после return в main() — --commit никогда
         не писал файл снимка, и суточная дельта по старому пути не считалась никогда."""

@@ -309,22 +309,29 @@ def main():
         except Exception:
             snap = {}
 
-    live, err = fetch_prices()
+    # сеть трогается только на запланированном запуске 21:00: ручной прогон обязан
+    # читать сохранённые цены, иначе каждый вызов ждёт ответ сайта (замер: 0.619 с
+    # на ручной запуск — это не «доля секунды», которую требует правило)
     note = None
     price_source = "default"
-    if live:
-        p = live
-        price_source = "live"
-        try:
-            os.makedirs(os.path.dirname(PRICE_CACHE), exist_ok=True)
-            write_json(PRICE_CACHE, {"model": LABEL, **p,
-                                     "fetched_at": datetime.now(timezone.utc).isoformat()})
-        except Exception:
-            pass
+    if commit:
+        live, err = fetch_prices()
+        if live:
+            p = live
+            price_source = "live"
+            try:
+                os.makedirs(os.path.dirname(PRICE_CACHE), exist_ok=True)
+                write_json(PRICE_CACHE, {"model": LABEL, **p,
+                                         "fetched_at": datetime.now(timezone.utc).isoformat()})
+            except Exception:
+                pass
+        else:
+            p = load_cache() or DEFAULTS
+            price_source = "cache" if load_cache() else "default"
+            note = f"Цены с сайта взять не удалось ({err}) — использованы последние сохранённые."
     else:
         p = load_cache() or DEFAULTS
         price_source = "cache" if load_cache() else "default"
-        note = f"Цены с сайта взять не удалось ({err}) — использованы последние сохранённые."
 
     rate_note = None
     rate_source = "default"
