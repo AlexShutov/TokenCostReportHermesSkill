@@ -431,7 +431,9 @@ def main():
     else:
         max_cap = registry.monthly_cap("max", window.days())
         caps = [(p, registry.monthly_cap(p, window.days())) for p in registry.order()]
-        within, ov, details = C.OverflowLedger(calc, mult, peak).split(plan_rows, caps)
+        # оплаченные z.ai — не план: они не участвуют в расщеплении по лимитам
+        split_rows = [r for r in plan_rows if r["plan_class"] != C.PAID_CLASS]
+        within, ov, details = C.OverflowLedger(calc, mult, peak).split(split_rows, caps)
         by_day = C.group_overflow(details, lambda r: datetime.fromtimestamp(r["window_end"], C.PEAK_TZ).date())
         by_sess = C.group_overflow(details, lambda r: r["session_id"])
         today_pk = datetime.now(C.PEAK_TZ).date()

@@ -298,6 +298,24 @@ class Report(Case):
         self.assertNotIn("7000.00M", tail,
                          f"блок пересчёта показывает общее количество токенов: {tail}")
 
+    def test_paid_rows_do_not_enter_the_overflow_split(self):
+        """Баг M1 в частном случае: оплаченные z.ai не участвуют в расщеплении
+        по лимитам каскада — переполнение считается только по плановым строкам."""
+        import plan_core as PC
+        start, end = self.seed_row(tokens=7000000000)
+        self.seed_row(tokens=2000000, plan_class="zai_paid")
+        out = self.capture([])
+        day = datetime.fromtimestamp(end, PC.PEAK_TZ).date()
+        share = PC.DayIntegralPeakModel().share(day, start, end)
+        base = 7000000000 * 2.3 / 10000
+        credits = base * (share + (1.0 - share) * PC.OFFPEAK_FACTOR)
+        expected = 7000000000 * (credits - 930000) / credits
+        tail = out.split("Пересчёт токенов", 1)[-1]
+        self.assertIn(f"{expected/1e6:.2f}M", tail,
+                      f"оплаченная строка попала в расщепление: {tail[:200]}")
+        self.assertIn("Оплаченные z.ai в окне", out,
+                      f"оплаченные не названы отдельной строкой: {out[:300]}")
+
     def test_plan_transition_message_printed_once(self):
         """Переход Light -> Pro сообщается один раз: состояние плана обновляется
         и в основной ветке (не только в ветке переполнения Max)."""

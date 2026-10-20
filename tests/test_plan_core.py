@@ -393,6 +393,28 @@ class SourceBranches(unittest.TestCase):
         self.assertEqual(src.anomalies(self.window), 1)
         self.assertEqual(src.unknown_count(self.window), 1)
 
+    def test_paid_rows_excluded_from_plan_credits(self):
+        """Баг M1: оплаченные z.ai (реально списанные деньги) не план — они не должны
+        входить в кредиты плана, но обязаны называться отдельной строкой блока."""
+        w = P.MonthWindow(date(2026, 10, 19))
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta",
+                    ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 1000000),
+                row("glm-5.3-flash", "zai_paid", "delta",
+                    ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 2000000)]
+        src = P.InMemoryIncrementSource(rows)
+        rep = P.PlanReport(w, P.PlanCascade(P.PlanRegistry(), w), P.StandardCreditCalculator(),
+                           P.MultiplierRegistry(), P.PlanRegistry(), P.DayIntegralPeakModel(),
+                           state={}, source=src)
+        got = rep.rows()
+        self.assertEqual(len(got), 2, "источник обязан отдавать и оплаченные строки")
+        self.assertAlmostEqual(rep.credits(got), 134.17, places=2,
+                               msg="оплаченные строки вошли в кредиты плана")
+        out = rep.build(got, rep.credits(got))
+        self.assertTrue(any("Оплаченные z.ai в окне" in l for l in out),
+                        f"оплаченные не названы отдельной строкой: {out}")
+        self.assertFalse(any("2.00M" in l and "Кредиты за окно" in l for l in out),
+                         f"итог токенов окна включает оплаченные: {out}")
+
     def test_degraded_when_source_missing(self):
         report = P.PlanReport(self.window, P.PlanCascade(P.PlanRegistry(), self.window),
                               P.StandardCreditCalculator(), P.MultiplierRegistry(),

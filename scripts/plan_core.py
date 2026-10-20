@@ -56,6 +56,7 @@ PLANS = {
 PLAN_ORDER = ("light", "pro", "max")
 MAX_PLAN = "max"
 ZAI_PLANS = ("zai_plan", "zai_plan_by_rule", "zai_paid")
+PAID_CLASS = "zai_paid"
 
 # Дефолт дня начала отсчёта месяца при установке навыка с нуля (запрос пользователя,
 # 2026-10-20): 19-е число — чтобы данные, уже имеющиеся в базе, попали в расчёт.
@@ -565,6 +566,8 @@ class PlanReport:
     def credits(self, rows):
         total = 0.0
         for r in rows:
+            if r["plan_class"] == PAID_CLASS:
+                continue          # оплаченные z.ai — не план, в процент не входит
             day = datetime.fromtimestamp(r["window_end"], PEAK_TZ).date()
             mult = (self.multipliers.for_model(r["model"]) if self.by_actual
                     else self.multipliers.for_model(self.multipliers.fallback_model()))
@@ -573,6 +576,9 @@ class PlanReport:
             if c is not None:
                 total += c
         return total
+
+    def paid_rows(self, rows):
+        return [r for r in rows if r["plan_class"] == PAID_CLASS]
 
     def build(self, rows=None, credits=None):
         rows = self.rows() if rows is None else rows
@@ -598,6 +604,8 @@ class PlanReport:
         if rows:
             tot = zero_tokens()
             for r in rows:
+                if r["plan_class"] == PAID_CLASS:
+                    continue
                 add_tokens(tot, r["tokens"])
             if self.by_actual:
                 lines.append("Кредиты за окно: %.1f (по мультипликаторам фактической модели каждой строки)"
@@ -608,6 +616,11 @@ class PlanReport:
                              "выход %.2fM x %.1f)" % (credits, tot["input"] / 1e6, m["input"],
                                                        tot["cached"] / 1e6, m["cached"],
                                                        tot["output"] / 1e6, m["output"]))
+            paid = self.paid_rows(rows)
+            if paid:
+                ptok = sum(sum(r["tokens"].values()) for r in paid)
+                lines.append("Оплаченные z.ai в окне: %d строк (%.2fM токенов) — списаны деньгами, "
+                             "не планом; в процент плана не входят" % (len(paid), ptok / 1e6))
             for step in self.cascade.evaluate(credits):
                 lines.append("использовано %.1f%% %s плана (%.1f кредитов из месячного лимита %.1f)"
                              % (step.pct, step.plan.capitalize(), step.used, step.cap))
