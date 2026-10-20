@@ -34,6 +34,7 @@ def run(transport=None, dry=False):
     без неё это сетевой путь, который нельзя проверить offline. --dry-run проверяется
     здесь же: живой прогон без отправки возможен только если флаг читает сам скрипт."""
     os.environ.setdefault("TOKEN_COST_CRON_JOB", "token-cost-daily")
+    dry = dry or ("--dry-run" in sys.argv)
     sys.argv = ["token_cost.py", "--commit"]
     text = C.main()
     if not text:

@@ -202,6 +202,15 @@ class Delivery(Case):
         self.assertEqual(self.calls[1][1]["chat_id"], "362122320",
                          "без переменной должен оставаться чат автора")
 
+    def test_dry_run_flag_is_read_before_argv_is_rewritten(self):
+        """run() подменяет argv на --commit: флаг dry-run обязан читаться ДО подмены,
+        иначе живой прогон без отправки невозможен."""
+        import token_cost_commit as W
+        sys.argv = ["token_cost_commit.py", "--dry-run"]
+        r = W.run(transport=self.transport)
+        self.assertTrue(r.get("dry"), f"флаг dry-run прочитан после подмены argv: {r}")
+        self.assertEqual(self.calls, [], "dry-run отправил сообщение в чат")
+
     def test_stdout_stays_empty_so_cron_does_not_post_a_second_copy(self):
         """Задача без агента доставляет stdout как есть: сообщение уже отправлено
         через Bot API, поэтому отчёт о доставке пишется в лог, а не в stdout."""
