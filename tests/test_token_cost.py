@@ -429,29 +429,37 @@ class Guards(unittest.TestCase):
     """Минорные правила, которые кодом не реализованы: закрытый файл и homoglyph."""
 
     skill = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    tests = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests")
+
+    def scan(self, dirs, pattern):
+        bad = []
+        for d in dirs:
+            for name in sorted(os.listdir(d)):
+                if not name.endswith(".py"):
+                    continue
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    for n, line in enumerate(f, 1):
+                        for m in pattern.findall(line):
+                            bad.append("%s:%d %s" % (name, n, m if isinstance(m, str) else line.strip()[:80]))
+        return bad
 
     def test_scripts_read_files_with_context_manager(self):
         bad = []
-        for name in sorted(os.listdir(self.skill)):
-            if not name.endswith(".py"):
-                continue
-            for n, line in enumerate(open(os.path.join(self.skill, name), encoding="utf-8"), 1):
-                if re.search(r"\bopen\(", line) and "with open" not in line:
-                    bad.append("%s:%d %s" % (name, n, line.strip()[:80]))
+        for d in (self.skill, self.tests):
+            for name in sorted(os.listdir(d)):
+                if not name.endswith(".py"):
+                    continue
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    for n, line in enumerate(f, 1):
+                        if re.search(r"\bopen\(", line) and "with open" not in line:
+                            bad.append("%s:%d %s" % (name, n, line.strip()[:80]))
         self.assertFalse(bad, "незакрытый open(): " + "; ".join(bad))
 
     def test_no_latin_letters_inside_cyrillic_words(self):
         """Homoglyph не даёт синтаксической ошибки и не ловится тестом — слово
         просто никогда не совпадёт (правило навыка)."""
         pat = re.compile(r"[а-яё]+[a-z]+|[a-z]+[а-яё]+")
-        bad = []
-        for name in sorted(os.listdir(self.skill)):
-            if not name.endswith(".py"):
-                continue
-            for n, line in enumerate(open(os.path.join(self.skill, name), encoding="utf-8"), 1):
-                for m in pat.findall(line):
-                    if re.search(r"[а-яё]", m) and re.search(r"[a-z]", m):
-                        bad.append("%s:%d %s" % (name, n, m))
+        bad = self.scan([self.skill, self.tests], pat)
         self.assertFalse(bad, "homoglyph: " + "; ".join(bad))
 
 

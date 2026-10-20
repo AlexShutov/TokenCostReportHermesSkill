@@ -91,18 +91,22 @@ def main():
     with open(stale, "w", encoding="utf-8") as f:
         f.write("# прежняя версия на машине коллеги\n")
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"))
-    kept = open(stale, encoding="utf-8").read().strip()
+    with open(stale, encoding="utf-8") as f:
+        kept = f.read().strip()
     check("setup.sh предупреждает и НЕ перезаписывает отличающийся файл",
           "ВНИМАНИЕ" in out and kept == "# прежняя версия на машине коллеги",
           out[:160])
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "--force")
+    with open(stale, encoding="utf-8") as f:
+        after_force = f.read().strip()
     check("setup.sh --force перезаписывает осознанно",
-          open(stale, encoding="utf-8").read().strip() != "# прежняя версия на машине коллеги",
+          after_force != "# прежняя версия на машине коллеги",
           out[:160])
 
     # M4: некорректный день не должен молча записываться в состояние
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "abc")
-    saved = json.load(open(os.path.join(state, "token_cost_plan.json"), encoding="utf-8"))
+    with open(os.path.join(state, "token_cost_plan.json"), encoding="utf-8") as f:
+        saved = json.load(f)
     check("setup.sh отвергает некорректный день и оставляет значение по умолчанию",
           "не понял" in out and saved["anchor_date"] != "abc", out[:160])
     check("setup.sh создаёт state/", os.path.isdir(state))
@@ -124,9 +128,9 @@ def main():
 
     # 5. jobs.json с профилем коллеги — проверка, что профиль берётся оттуда
     os.makedirs(os.path.join(HOME, ".hermes", "cron"), exist_ok=True)
-    json.dump({"jobs": [{"id": "x", "name": "token-counter", "profile": "colleague",
-                         "no_agent": True, "script": "token_cost_tick.py"}]},
-              open(os.path.join(HOME, ".hermes", "cron", "jobs.json"), "w"))
+    with open(os.path.join(HOME, ".hermes", "cron", "jobs.json"), "w", encoding="utf-8") as f:
+        json.dump({"jobs": [{"id": "x", "name": "token-counter", "profile": "colleague",
+                             "no_agent": True, "script": "token_cost_tick.py"}]}, f)
 
     # 6. dry-run: печатает и ничего не пишет
     rc, out, err = run(os.path.join(scripts, "token_cost.py"), "--dry-run")
