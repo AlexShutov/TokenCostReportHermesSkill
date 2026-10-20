@@ -152,11 +152,18 @@ def main():
           after_force != "# прежняя версия плагина на машине коллеги", out[:160])
 
     # поведение, а не текст исходника: импорт из копии во временном HOME
+    # (HERMES_HOME задаёт домашний каталог Hermes — на машине коллеги это его HOME;
+    # без подмены тест читал бы домашний каталог автора и проверял не тот путь)
+    os.environ["HERMES_HOME"] = os.path.join(HOME, ".hermes")
     import importlib.util
     spec = importlib.util.spec_from_file_location("tcr_clean_plugin",
                                                   os.path.join(plug_dir, "__init__.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    with open(os.path.join(plug_dir, "__init__.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("плагин не содержит абсолютного пути автора (на чужой машине такой путь не существует)",
+          "/Users/alex" not in src, src[:120])
 
     registered = {}
     class FakeCtx:
@@ -189,6 +196,16 @@ def main():
         return type("P", (), {"returncode": 1, "stdout": "", "stderr": "база заблокирована"})()
     check("ошибка запуска сообщается строкой, а не молчит",
           "база заблокирована" in mod.run("", chat=CHAT, spawn=err_spawn), "")
+    # ветка без HERMES_HOME — обычный случай на машине коллеги: путь обязан
+    # решаться от домашнего каталога пользователя, а не от пути автора
+    os.environ.pop("HERMES_HOME", None)
+    spec2 = importlib.util.spec_from_file_location("tcr_clean_plugin_fresh",
+                                                   os.path.join(plug_dir, "__init__.py"))
+    mod2 = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(mod2)
+    check("без HERMES_HOME путь решается от HOME пользователя",
+          mod2.SCRIPT == os.path.join(HOME, ".hermes", "scripts", "token_cost_commit.py"),
+          mod2.SCRIPT)
     check("single_message.py скопирован в ~/.hermes/scripts",
           os.path.exists(os.path.join(scripts, "single_message.py")), "крон исполняет только оттуда")
     check("setup.sh предлагает выбрать день начала подписки",
