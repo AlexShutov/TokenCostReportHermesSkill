@@ -21,6 +21,13 @@ HOME = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
 SCRIPT = os.path.join(HOME, "scripts", "token_cost_commit.py")
 DEFAULT_CHAT = "362122320"
 TIMEOUT = 60
+SPAWN = None   # подменяемая точка вызова: тест обязан иметь mock, иначе проверка
+               # сводится к чтению исходника и проходит, когда логика сломана
+
+
+def _default_spawn(env):
+    return subprocess.run([sys.executable, SCRIPT], env=env,
+                          capture_output=True, text=True, timeout=TIMEOUT)
 
 
 def resolve_chat():
@@ -41,8 +48,7 @@ def run(raw_args="", chat=None, spawn=None):
     env["TOKEN_COST_CHAT_ID"] = chat
     env["TOKEN_COST_CRON_JOB"] = "token-cost-daily"
     if spawn is None:
-        spawn = lambda e: subprocess.run(
-            [sys.executable, SCRIPT], env=e, capture_output=True, text=True, timeout=TIMEOUT)
+        spawn = SPAWN or _default_spawn
     try:
         proc = spawn(env)
     except Exception as exc:

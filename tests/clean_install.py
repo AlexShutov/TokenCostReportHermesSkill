@@ -127,6 +127,68 @@ def main():
     check("single_message.py лежит в репо навыка",
           os.path.exists(os.path.join(skill, "scripts", "single_message.py")),
           "нет файла в репо — доставка одного сообщения невоспроизводима")
+
+    # ── плагин-команда /token-cost-daily ──
+    # Без файлов плагина в репо команда на машине коллеги не появляется: проверка
+    # идёт на клонированной копии, а не на исходнике автора
+    plugin_src = os.path.join(skill, "plugin")
+    check("плагин лежит в репо навыка",
+          os.path.exists(os.path.join(plugin_src, "plugin.yaml"))
+          and os.path.exists(os.path.join(plugin_src, "__init__.py")),
+          "нет plugin/ в репо — команда невоспроизводима")
+    plug_dir = os.path.join(HOME, ".hermes", "plugins", "token-cost-daily")
+    check("setup.sh копирует плагин во временный HOME и печатает команду включения",
+          os.path.exists(os.path.join(plug_dir, "plugin.yaml"))
+          and os.path.exists(os.path.join(plug_dir, "__init__.py"))
+          and "hermes plugins enable token-cost-daily" in first_out,
+          first_out[:160])
+    stale_plugin = os.path.join(plug_dir, "__init__.py")
+    with open(stale_plugin, "w", encoding="utf-8") as f:
+        f.write("# прежняя версия плагина на машине коллеги\n")
+    rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "--force")
+    with open(stale_plugin, encoding="utf-8") as f:
+        after_force = f.read().strip()
+    check("setup.sh --force перезаписывает плагин осознанно",
+          after_force != "# прежняя версия плагина на машине коллеги", out[:160])
+
+    # поведение, а не текст исходника: импорт из копии во временном HOME
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tcr_clean_plugin",
+                                                  os.path.join(plug_dir, "__init__.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    registered = {}
+    class FakeCtx:
+        def register_command(self, name, handler, description="", args_hint=""):
+            registered[name] = handler
+    mod.register(FakeCtx())
+    check("register() регистрирует команду ровно под именем token-cost-daily",
+          list(registered) == ["token-cost-daily"], str(list(registered)))
+
+    calls = []
+    class FakeProc:
+        returncode, stdout, stderr = 0, "", ""
+    def fake_spawn(env):
+        calls.append(dict(env))
+        return FakeProc()
+    handler = registered["token-cost-daily"]
+    mod.SPAWN = fake_spawn          # mock-точка вызова: тест не запускает реальный скрипт
+    os.environ["HERMES_SESSION_CHAT_ID"] = CHAT
+    result = handler("")
+    check("обработчик возвращает None — второй копии сообщения в чате нет",
+          result is None, repr(result)[:160])
+    check("чат берётся из сессионного контекста гейтвея (не hardcoded)",
+          calls and calls[0].get("TOKEN_COST_CHAT_ID") == CHAT, str(calls[:1]))
+    # путь скрипта обязан решаться от временного HOME коллеги: абсолютный путь
+    # автора на чужой машине не существует, и команда падает
+    check("плагин вызывает скрипт, который setup.sh скопировал во временный HOME",
+          mod.SCRIPT == os.path.join(scripts, "token_cost_commit.py")
+          and os.path.exists(mod.SCRIPT), mod.SCRIPT)
+    def err_spawn(env):
+        return type("P", (), {"returncode": 1, "stdout": "", "stderr": "база заблокирована"})()
+    check("ошибка запуска сообщается строкой, а не молчит",
+          "база заблокирована" in mod.run("", chat=CHAT, spawn=err_spawn), "")
     check("single_message.py скопирован в ~/.hermes/scripts",
           os.path.exists(os.path.join(scripts, "single_message.py")), "крон исполняет только оттуда")
     check("setup.sh предлагает выбрать день начала подписки",
