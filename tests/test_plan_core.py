@@ -375,6 +375,26 @@ class SourceBranches(unittest.TestCase):
     def setUp(self):
         self.window = P.MonthWindow(date(2026, 10, 19))
 
+    def test_single_definition_of_excluded_rows_in_both_paths(self):
+        """Одно определение исключённых атрибуций для обоих путей: раньше путь ядра
+        имел своё условие (только anomaly), и выбрасываемый интервал попадал в
+        кредиты плана. Замер: строка gap 50000 — путь базы её не считает, путь ядра
+        считал. Плюс плейсхолдеры общего условия (2) не совпадали с числом
+        аргументов — 7 против 5, ошибка подстановки на живом прогоне."""
+        import token_cost_db as T
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "gap",
+                    ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 50000),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta",
+                    ts(2026, 10, 20, 15), ts(2026, 10, 20, 16), 10000)]
+        con = fake_db(rows)
+        s = T.window_sum(con, "zai_plan_by_rule",
+                         self.window.start.timestamp(), self.window.end.timestamp())
+        core = P.SqliteIncrementSource(lambda: con).rows(self.window)
+        self.assertEqual(s[0], 10000, "путь базы посчитал выбрасываемый интервал")
+        self.assertEqual(sum(r["tokens"]["input"] for r in core), 10000,
+                         "путь ядра посчитал выбрасываемый интервал")
+        con.close()
+
     def test_gaps_are_counted_and_named(self):
         src = P.InMemoryIncrementSource([row("glm-5.3-flash", "zai_plan_by_rule", "gap",
                                              ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 50000)])

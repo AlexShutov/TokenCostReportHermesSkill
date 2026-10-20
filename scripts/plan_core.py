@@ -261,7 +261,8 @@ class InMemoryIncrementSource(IncrementSource):
         self._rows = list(rows)
 
     def rows(self, window):
-        return [r for r in self._rows if window.contains(r["window_end"])]
+        return [r for r in self._rows if window.contains(r["window_end"])
+                and r["attribution"] not in A.EXCLUDED_ATTRIBUTION]
 
     def anomalies(self, window):
         return sum(1 for r in self._rows if r["attribution"] == "anomaly"
@@ -299,9 +300,10 @@ class SqliteIncrementSource(IncrementSource):
             cur = con.execute(
                 "SELECT session_id, model, plan_class, attribution, window_start, window_end, "
                 "input_delta, cache_delta, output_delta FROM increments "
-                "WHERE attribution<>'anomaly' AND plan_class IN (" + ph + ") "
+                "WHERE " + A.excluded_sql() + " AND plan_class IN (" + ph + ") "
                 "AND window_end>=? AND window_start<=?",
-                list(self._plan_classes) + [window.start.timestamp(), window.end.timestamp()])
+                list(A.EXCLUDED_ATTRIBUTION) + list(self._plan_classes)
+                + [window.start.timestamp(), window.end.timestamp()])
             rows = []
             for r in cur.fetchall():
                 rows.append({"session_id": r[0], "model": r[1], "plan_class": r[2],
