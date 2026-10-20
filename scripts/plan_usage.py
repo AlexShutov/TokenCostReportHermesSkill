@@ -132,7 +132,7 @@ def main(argv=None):
     credits = report.credits(rows)
     print("\n".join(report.build(rows, credits)))
 
-    # переход плана фиксируется только при недrom-запуске (тесты не пишут)
+    # переход плана фиксируется только при нормальном запуске (тесты не пишут)
     if not dry and rows:
         prev = state.get("plan")
         new_plan = report.cascade.current_plan(credits)
