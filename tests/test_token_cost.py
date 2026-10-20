@@ -282,12 +282,14 @@ class Report(Case):
                     "VALUES('x', ?, 'manual', NULL, 'default', 's1', NULL, NULL, '{}', 0, 'default', '{}')",
                     (now,))
         rid = con.execute("SELECT MAX(run_id) FROM runs").fetchone()[0]
+        # провайдер зависит от класса: локальный ряд не может идти через z.ai
+        prov, url = ("custom", "http://192.168.1.107:8080/v1") if plan_class == "local" else ("zai", "https://api.z.ai")
         con.execute("INSERT INTO increments(run_id, run_at, run_epoch, window_start, window_end, "
                     "session_id, model, billing_provider, billing_base_url, billing_mode, task, "
                     "plan_class, input_delta, cache_delta, output_delta, attribution, note) "
-                    "VALUES(?, 'x', ?, ?, ?, 's1', ?, 'zai', 'https://api.z.ai', '', 'chat', "
+                    "VALUES(?, 'x', ?, ?, ?, 's1', ?, ?, ?, '', 'chat', "
                     "?, ?, 0, 0, ?, ?)",
-                    (rid, now, now - 100, now, model, plan_class, tokens, attribution, note))
+                    (rid, now, now - 100, now, model, prov, url, plan_class, tokens, attribution, note))
         con.commit()
         PC.PlanStateStore(os.path.join(self.T.STATE, "token_cost_plan.json")).save(
             {"anchor_date": datetime.now(PC.PEAK_TZ).date().isoformat()})
@@ -362,7 +364,7 @@ class Report(Case):
         """Частный случай: каскад переполнен — доставляется прежняя версия про токены,
         и только переполнение, а не общее количество токенов."""
         import plan_core as PC
-        start, end = self.seed_row(tokens=7000000000)
+        start, end = self.seed_row(plan_class="local", tokens=7000000000)
         out, log = self.capture([])
         self.assertIn("Сравнительная цена токенов — только локальные LLM", out, out)
         self.assertIn("Работа аналогичного агента на GLM-5.3-Flash за последние сутки:", out, out)
@@ -382,7 +384,7 @@ class Report(Case):
 
     def test_paid_rows_do_not_enter_the_overflow_split(self):
         import plan_core as PC
-        start, end = self.seed_row(tokens=7000000000)
+        start, end = self.seed_row(plan_class="local", tokens=7000000000)
         self.seed_row(tokens=2000000, plan_class="zai_paid")
         out, log = self.capture([])
         day = datetime.fromtimestamp(end, PC.PEAK_TZ).date()
@@ -398,7 +400,7 @@ class Report(Case):
     def test_plan_state_updated_once(self):
         """Переход плана не печатается в сообщение: доставляется ровно две строки,
         состояние обновляется один раз."""
-        self.seed_row(tokens=400000000)
+        self.seed_row(plan_class="local", tokens=400000000)
         out1, log1 = self.capture([])
         self.assertIn("Pro", out1.splitlines()[0], out1)
         with open(os.path.join(self.T.STATE, "token_cost_plan.json"), encoding="utf-8") as f:
@@ -428,7 +430,7 @@ class Report(Case):
         self.assertEqual(con.execute("SELECT job FROM runs").fetchone()[0], "tick")
 
     def test_hours_line_only_in_overflow_case(self):
-        self.seed_row(tokens=7000000000)
+        self.seed_row(plan_class="local", tokens=7000000000)
         out, log = self.capture([])
         self.assertIn("запуска 21:00 ещё нет", out, f"строка 'с 21:00' пропала: {out}")
 

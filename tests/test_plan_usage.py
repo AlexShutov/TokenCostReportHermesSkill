@@ -195,7 +195,7 @@ class Block(Case):
         # 7 453 416 входных токенов = 1000 кредитов (2.3 x 7/12 на 10000 токенов)
         # -> 1000 / 44285.7 = 2.258% -> "Равно 2.3%"
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 7453416, 0, 0, "delta")])
+                   "local", 7453416, 0, 0, "delta")])
         code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertEqual(out.splitlines()[0], "Равно 2.3% плана Light на Z.ai")
         self.assertIn("использовано", out)
@@ -209,27 +209,32 @@ class Block(Case):
 
     def test_anomaly_rows_not_counted(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 10000, 0, 0, "delta"),
+                   "local", 10000, 0, 0, "delta"),
                    (ts(2026, 10, 19, 15, 30), ts(2026, 10, 19, 16, 0), "glm-5.3-flash",
-                    "zai_plan_by_rule", -5000, 0, 0, "anomaly")])
+                    "local", -5000, 0, 0, "anomaly")])
         code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("0.01M", out)          # только 10 000, а не 5 000
 
-    def test_local_rows_not_counted_in_plan(self):
-        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "qwen",
-                   "local", 100000, 0, 0, "delta")])
-        code, out = self.capture(["--dry-run", "--month", "2026-10"])
-        self.assertIn("Строк плана в окне нет", out)
+    def test_zai_rows_logged_but_not_counted(self):
+        """z.ai-строки логируются в базе, но статистику (кредиты) не формируют."""
+        self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
+                   "zai_plan_by_rule", 100000, 0, 0, "delta")])
+        # dry-run не читает базу (источник отсутствует) — строка лога появляется
+        # только в реальном прогоне, где источник подключён
+        code, out = self.capture(["--month", "2026-10"])
+        self.assertIn("Локальных строк в окне нет", out)
+        self.assertIn("логируются в базе, но в статистику не входят", out)
+        self.assertIn("z.ai-строки в окне: 1 (0.10M токенов)", out)
 
     def test_rows_outside_month_window_excluded(self):
         self.seed([(ts(2026, 9, 30, 15, 0), ts(2026, 9, 30, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 100000, 0, 0, "delta")])
+                   "local", 100000, 0, 0, "delta")])
         code, out = self.capture(["--dry-run", "--month", "2026-10"])
-        self.assertIn("Строк плана в окне нет", out)
+        self.assertIn("Локальных строк в окне нет", out)
 
     def test_unknown_model_named(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-4.7",
-                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
+                   "local", 10000, 0, 0, "delta")])
         code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("без опубликованных мультипликаторов", out)
         self.assertIn("glm-4.7", out)
@@ -248,7 +253,7 @@ class Block(Case):
 
     def test_point_rows_flagged_as_estimate(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 0), "glm-5.3-flash",
-                   "zai_plan_by_rule", 10000, 0, 0, "backfill")])
+                   "local", 10000, 0, 0, "backfill")])
         code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("оценка", out)
 
@@ -256,7 +261,7 @@ class Block(Case):
         # 10000 токенов glm-5.3: по мультипликаторам строки = 6.9 x 7/12 = 4.025 кредита,
         # по эквивалентной модели = 2.3 x 7/12 = 1.342
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3",
-                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
+                   "local", 10000, 0, 0, "delta")])
         code, out = self.capture(["--dry-run", "--month", "2026-10", "--by-actual-model"])
         self.assertIn("по мультипликаторам фактической модели", out)
         self.assertIn("Кредиты за окно: 4.0", out)
@@ -278,21 +283,21 @@ class Transition(Case):
     def test_overflow_message_and_state_write(self):
         # 400M входных токенов = 53666.7 кредитов > месячного лимита Light (44285.7)
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 400000000, 0, 0, "delta")])
+                   "local", 400000000, 0, 0, "delta")])
         code, out = self.capture(["--month", "2026-10"])
         self.assertIn("Превышен план Light, перешли на Pro", out)
         self.assertEqual(self.state()["plan"], "pro")
 
     def test_no_message_when_plan_unchanged(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 10000, 0, 0, "delta")])
+                   "local", 10000, 0, 0, "delta")])
         code, out = self.capture(["--month", "2026-10"])
         self.assertNotIn("Превышен", out)
         self.assertEqual(self.state()["plan"], "light")
 
     def test_dry_run_does_not_write_plan_state(self):
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 400000000, 0, 0, "delta")])
+                   "local", 400000000, 0, 0, "delta")])
         code, out = self.capture(["--dry-run", "--month", "2026-10"])
         self.assertIn("Превышен план Light, перешли на Pro", out)
         self.assertFalse(os.path.exists(self.plan_file))
@@ -301,7 +306,7 @@ class Transition(Case):
         # суммарный лимит каскада = 44285.7 + 265714.3 + 620000 = 930000 кредитов;
         # 7 млрд входных токенов = 940833.3 кредитов — за пределами Max
         self.seed([(ts(2026, 10, 19, 15, 0), ts(2026, 10, 19, 15, 30), "glm-5.3-flash",
-                   "zai_plan_by_rule", 7000000000, 0, 0, "delta")])
+                   "local", 7000000000, 0, 0, "delta")])
         code, out = self.capture(["--month", "2026-10"])
         self.assertIn("План Max переполнен, переходим на пересчет токенов.", out)
 
