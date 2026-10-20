@@ -99,6 +99,12 @@ def main():
     check("setup.sh --force перезаписывает осознанно",
           open(stale, encoding="utf-8").read().strip() != "# прежняя версия на машине коллеги",
           out[:160])
+
+    # M4: некорректный день не должен молча записываться в состояние
+    rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "abc")
+    saved = json.load(open(os.path.join(state, "token_cost_plan.json"), encoding="utf-8"))
+    check("setup.sh отвергает некорректный день и оставляет значение по умолчанию",
+          "не понял" in out and saved["anchor_date"] != "abc", out[:160])
     check("setup.sh создаёт state/", os.path.isdir(state))
     check("setup.sh предлагает выбрать день начала подписки",
           "--set-anchor" in out and "начал" in out.lower(), out.strip()[:160])

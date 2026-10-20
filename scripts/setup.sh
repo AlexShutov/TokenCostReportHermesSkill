@@ -47,32 +47,39 @@ else
 fi
 
 # выбор дня начала подписки — предлагается при установке с нуля
-if [ -t 0 ]; then
-  "$PY" - <<'EOF'
-import json, os, sys
+ANSWER="${1:-}"
+if [ "$ANSWER" = "--force" ]; then
+  ANSWER=""
+fi
+if [ -z "$ANSWER" ] && [ -t 0 ]; then
+  printf 'День начала отсчёта месячного плана z.ai: число 1-31 или дата YYYY-MM-DD.\n'
+  printf 'Enter — вчера (%s): так все данные, уже имеющиеся в базе, попадают в расчёт.\n' "$(date -v-1d +%Y-%m-%d 2>/dev/null || date -d yesterday +%Y-%m-%d)"
+  read -r ANSWER
+fi
+"$PY" - "$SKILL_DIR" "$ANSWER" <<'EOF'
+import json, os, subprocess, sys
 from datetime import date, timedelta
 
 state = os.path.expanduser("~/.hermes/state")
 os.makedirs(state, exist_ok=True)
 path = os.path.join(state, "token_cost_plan.json")
 yesterday = (date.today() - timedelta(days=1)).isoformat()
-print("День начала отсчёта месячного плана z.ai: число 1-31 или дата YYYY-MM-DD.")
-print("Enter — вчера (%s): так все данные, уже имеющиеся в базе, попадают в расчёт." % yesterday)
-raw = sys.stdin.readline().strip()
-if not raw:
-    value = yesterday
-else:
-    try:
-        value = date.fromisoformat(raw).isoformat() if len(raw) == 10 else min(int(raw), 31)
-    except ValueError:
-        sys.exit("не понял: нужен день 1-31 или дата YYYY-MM-DD")
+raw = sys.argv[2].strip()
+value = yesterday
+if raw:
+    # M4: значение проверяется тем же валидатором, что и CLI — иначе навык
+    # принимает nonsense вроде 'abc' или '2026-02-31' и молча пишет его в состояние
+    validator = os.path.join(sys.argv[1], "scripts", "plan_usage.py")
+    rc = subprocess.call([sys.executable, validator, "--set-anchor", raw, "--dry-run"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if rc != 0:
+        print("не понял: нужен день 1-31 или дата YYYY-MM-DD; значение '%s' не принято" % raw)
+        print("  использован день по умолчанию:", yesterday)
+    else:
+        value = raw
 st = {"anchor_date": value, "anchor_source": "saved", "plan": "light", "model": "glm-5.3-flash"}
 with open(path, "w", encoding="utf-8") as f:
     json.dump(st, f, ensure_ascii=False, indent=2)
 print("записано:", path, "->", st["anchor_date"])
+print("  свой день меняется так: python3 ~/.hermes/scripts/plan_usage.py --set-anchor <день или YYYY-MM-DD>")
 EOF
-else
-  echo "День начала отсчёта месячного плана (подписка): по умолчанию — 1-е число месяца;"
-  echo "  свой день сохраняется в ~/.hermes/state/token_cost_plan.json:"
-  echo "  python3 ~/.hermes/scripts/plan_usage.py --set-anchor <день или YYYY-MM-DD>"
-fi
