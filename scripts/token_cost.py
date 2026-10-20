@@ -478,6 +478,11 @@ def main():
             since_ov = day_ov
         delivered = ["Сравнительная цена токенов — только локальные LLM (z.ai не считается)",
                      "Работа аналогичного агента на GLM-5.3-Flash за последние сутки:"]
+        # строка о переходе — часть прежней версии про токены: в частном случае
+        # переполнения она доставляется, а не уходит в лог
+        transition = report.notifier.message(state.get("plan"), current) if report.notifier else None
+        if transition:
+            delivered.append(transition)
         delivered += block(C.as_tuple(day_ov), p, rate)
         if prev_commit:
             delivered.append(f"- с 21:00 предыдущего запуска: {money(cost(C.as_tuple(since_ov), p), rate)}")

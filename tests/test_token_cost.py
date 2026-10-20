@@ -367,6 +367,8 @@ class Report(Case):
         self.assertIn("Сравнительная цена токенов — только локальные LLM", out, out)
         self.assertIn("Работа аналогичного агента на GLM-5.3-Flash за последние сутки:", out, out)
         self.assertIn("переполнение Max", out, out)
+        self.assertIn("План Max переполнен, переходим на пересчет токенов.", out,
+                      f"строка о переходе не доставляется: {out[:200]}")
         day = datetime.fromtimestamp(end, PC.PEAK_TZ).date()
         share = PC.DayIntegralPeakModel().share(day, start, end)
         base = 7000000000 * 2.3 / 10000
