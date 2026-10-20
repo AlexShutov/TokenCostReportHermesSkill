@@ -294,7 +294,7 @@ def main():
                          "cache", cumulative, None)
         except Exception:
             pass
-        return
+        return ""
 
     cur_sess = totals(c, sid) if sid else (0, 0, 0)
     zai, zai_paid = zai_total(c)
@@ -437,16 +437,19 @@ def main():
     plan_rows = report.rows()
     credits = report.credits(plan_rows)
     current = report.cascade.current_plan(credits)
-    lines = report.build(plan_rows, credits)
+
+    # оговорки (окно, лимит, модель пика, backfill, unknown, MCP, состояние плана) —
+    # это размышления: они не входят в доставляемое сообщение. Они пишутся в лог
+    # (stderr) и остаются в базе, откуда восстанавливаются запросом
+    caveats = report.build(plan_rows, credits)[2:]
 
     if current is not None:
-        # основной путь: только план. Прежний расчёт токенов — частный случай,
-        # он включается только когда переполнен Max.
-        lines += ["", "Расчёт токенов не применяется — это частный случай, он включается "
-                      "только после переполнения плана Max."]
+        # основной путь: ровно две строки
+        delivered = report.delivered(plan_rows, credits)
     else:
+        # частный случай: переполнен Max — версия про токены, как раньше
         max_cap = registry.monthly_cap("max", window.days())
-        caps = [(p, registry.monthly_cap(p, window.days())) for p in registry.order()]
+        caps = [(pl, registry.monthly_cap(pl, window.days())) for pl in registry.order()]
         # оплаченные z.ai — не план: они не участвуют в расщеплении по лимитам
         split_rows = [r for r in plan_rows if r["plan_class"] != C.PAID_CLASS]
         within, ov, details = C.OverflowLedger(calc, mult, peak).split(split_rows, caps)
@@ -459,33 +462,39 @@ def main():
                 for k in day_ov:
                     day_ov[k] += t[k]
         sess_ov = by_sess.get(sid, C.zero_tokens())
-        lines += ["", f"Пересчёт токенов — только переполнение Max ({sum(ov.values())/1e6:.2f}M токенов "
-                      f"сверх месячного лимита Max ({max_cap:.1f} кредитов):", block(C.as_tuple(ov), p, rate)]
-        lines += [f"Не учтено (z.ai coding plan): {(zai - zai_paid)/1e6:.2f}M токенов"]
-        if zai_paid:
-            lines.append(f"  отдельно — оплаченные z.ai (реально списанные деньги, это не план): "
-                         f"{zai_paid/1e6:.2f}M токенов")
-        lines += ["", "За последние сутки (переполнение Max):", block(C.as_tuple(day_ov), p, rate)]
         if prev_commit:
             since_ov = C.zero_tokens()
             for r, frac, _c in details:
                 if frac and r["window_end"] >= prev_commit:
                     C.add_tokens(since_ov, r["tokens"], frac)
-            lines.append(f"- с 21:00 предыдущего запуска: {money(cost(C.as_tuple(since_ov), p), rate)}")
         else:
             since_ov = day_ov
-            lines.append(f"- с 21:00 предыдущего запуска: запуска 21:00 ещё нет — это то же суточное "
-                         f"окно: {money(cost(C.as_tuple(since_ov), p), rate)}")
+        delivered = ["Сравнительная цена токенов — только локальные LLM (z.ai не считается)",
+                     "Работа аналогичного агента на GLM-5.3-Flash за последние сутки:"]
+        delivered += block(C.as_tuple(day_ov), p, rate)
+        if prev_commit:
+            delivered.append(f"- с 21:00 предыдущего запуска: {money(cost(C.as_tuple(since_ov), p), rate)}")
+        else:
+            delivered.append("- с 21:00 предыдущего запуска: запуска 21:00 ещё нет — это то же "
+                             f"суточное окно: {money(cost(C.as_tuple(since_ov), p), rate)}")
         if hours and hours >= 1 / 60:
-            lines.append(f"- в среднем за час: {money(cost(C.as_tuple(since_ov), p) / hours, rate)}")
+            delivered.append(f"- в среднем за час: {money(cost(C.as_tuple(since_ov), p) / hours, rate)}")
         if sid:
-            lines += ["", "За текущую сессию (переполнение Max):", block(C.as_tuple(sess_ov), p, rate)]
+            delivered += ["", "Работа аналогичного агента на GLM-5.3-Flash за сессию:"]
+            delivered += block(C.as_tuple(sess_ov), p, rate)
             if started:
-                lines.append(f"- длительность сессии: {duration(time.time() - started)}")
+                delivered.append(f"- длительность сессии: {duration(time.time() - started)}")
         if by_day:
             day_lines = [f"- {d}: {sum(t.values())/1e6:.2f}M = {money(cost(C.as_tuple(t), p), rate)}"
                          for d, t in sorted(by_day.items(), reverse=True)[:4]]
-            lines += ["", "По дням (переполнение Max):"] + day_lines
+            delivered += ["", "По дням (переполнение Max):"] + day_lines
+        delivered += ["", f"Не учтено (z.ai coding plan): {(zai - zai_paid)/1e6:.2f}M токенов"]
+        if zai_paid:
+            delivered.append(f"  отдельно — оплаченные z.ai (реально списанные деньги, это не план): "
+                             f"{zai_paid/1e6:.2f}M токенов")
+        if db_note:
+            delivered += ["", db_note]
+        delivered += ["", "курс взят из «Плати по миру»"]
 
     # состояние плана обновляется в обеих ветвях: иначе переход Light->Pro
     # сообщался бы заново на каждом запуске
@@ -494,34 +503,33 @@ def main():
         state["plan"] = new_plan
         store.save(state)
 
+    extra = []
     if ledger_fresh:
-        lines += ["", "Копилка создана только что — «за всё время» считается с этого момента "
-                      "(ранее удалённые сессии восстановить нельзя)."]
+        extra.append("Копилка создана только что — «за всё время» считается с этого момента.")
     if not via_routing:
-        lines += ["", f"Сессия взята не через gateway_routing (chat {CHAT_ID}) — на другой машине "
-                      f"задай TOKEN_COST_CHAT_ID своим чатом, иначе блок «За текущую сессию» "
-                      f"может относиться не к тому пользователю."]
+        extra.append(f"Сессия взята не через gateway_routing (chat {CHAT_ID}) — на другой машине "
+                     f"задай TOKEN_COST_CHAT_ID своим чатом.")
     if note:
-        lines += ["", note]
+        extra.append(note)
     if rate_note:
-        lines += ["", rate_note]
-    if db_note:
-        # Standing format требует пометку про базу: раньше она собиралась в notes,
-        # но никогда не печаталась, и правила про anomaly/выбрасываемые интервалы
-        # молча не доходили до пользователя
-        lines += ["", db_note]
-    lines += ["", "курс взят из «Плати по миру»"]
-    print("\n".join(lines))
+        extra.append(rate_note)
+    if db_note and current is not None:
+        extra.append(db_note)
+    if caveats:
+        extra += caveats
+    if extra:
+        print("\n".join(extra), file=sys.stderr)
+
+    return "\n".join(delivered)
 
     if not dry and commit:
         # база суточного окна = значения копилки на этот запуск в 21:00
         os.makedirs(os.path.dirname(SNAP), exist_ok=True)
         write_json(SNAP, {"cumulative": dict(zip(KEYS, cumulative)),
                           "prices": p, "saved_at": datetime.now(timezone.utc).isoformat()})
-    elif not dry:
-        # ручной запуск тоже мог пополнить копилку — снимок не трогаем, но помечаем
-        pass
 
 
 if __name__ == "__main__":
-    main()
+    text = main()
+    if text:
+        print(text)

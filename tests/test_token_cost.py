@@ -297,181 +297,152 @@ class Report(Case):
         """Одна строка с окном, попадающим в текущее месячное окно, и якорь = сегодня."""
         self.seed_row(tokens, model, plan_class)
 
-    def test_base_note_is_delivered(self):
-        """Standing format требует пометку про базу — раньше она собиралась и никогда
-        не печаталась: правила про anomaly и выбрасываемые интервалы не доходили
-        до пользователя."""
-        self.seed_window()
-        out = self.capture([])
-        self.assertIn("Суточное окно = сумма инкрементов", out, out[:400])
+    def capture(self, argv, rows=None):
+        """Возвращает (доставляемое сообщение, лог). В сообщение уходит только то, что
+        просил пользователь; оговорки пишутся в stderr и остаются в базе."""
+        rows = rows if rows is not None else self.ROWS
+        self.C.conn = lambda: fake_source(rows)
+        self.T.src_connect = lambda: fake_source(rows)
+        self.C.resolve_session = lambda c: "s1"
+        self.C.fetch_prices = lambda: (None, "тест без сети")
+        self.C.fetch_rate = lambda: (None, "тест без сети")
+        sys.argv = ["token_cost.py"] + argv
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            delivered = self.C.main()
+        return delivered, err.getvalue()
 
-    def test_dropped_intervals_are_named_in_the_report(self):
+    def test_delivered_is_exactly_two_lines(self):
+        """Правило пользователя: из всего вывода нужны ровно две строки."""
+        out, log = self.capture([])
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 2, f"доставляется не две строки: {out!r}")
+        self.assertTrue(lines[0].startswith("Равно") and "на Z.ai" in lines[0], lines[0])
+        self.assertEqual(lines[1],
+                         "Эквивалентный кодовый план z.ai (эквивалентная модель glm-5.3-flash)",
+                         lines[1])
+
+    def test_caveats_are_not_delivered_but_are_in_the_log(self):
+        out, log = self.capture([])
+        for phrase in ("Суточное окно", "Месячный лимит", "MCP-вызовы", "Пик/офф-пик"):
+            self.assertNotIn(phrase, out, f"размышление попало в сообщение: {out!r}")
+            self.assertIn(phrase, log, f"оговорка пропала из лога: {log!r}")
+
+    def test_unknown_plan_noted_in_the_log(self):
+        self.seed_row(model="m", plan_class="unknown")
+        out, log = self.capture([])
+        self.assertIn("plan unknown", log, log)
+        self.assertNotIn("plan unknown", out, out)
+
+    def test_anomalies_reported_in_the_log(self):
+        self.seed_row(model="m", plan_class="local", tokens=0, attribution="anomaly",
+                      note="строка уменьшилась")
+        out, log = self.capture([])
+        self.assertIn("Anomaly-строки", log, log)
+        self.assertNotIn("Anomaly", out, out)
+
+    def test_dropped_intervals_are_named_in_the_log(self):
         self.seed_row(tokens=5000000, attribution="gap", note="интервал 2400 с")
-        out = self.capture([])
-        self.assertIn("Выбрасываемые интервалы", out, out[:400])
-        self.assertIn("TOKEN_COST_MAX_WINDOW", out, out[:400])
+        out, log = self.capture([])
+        self.assertIn("Выбрасываемые интервалы", log, log)
+        self.assertNotIn("Выбрасываемые интервалы", out, out)
 
     def test_no_dropped_interval_line_when_there_are_none(self):
         self.seed_row(tokens=1000000, attribution="delta")
-        out = self.capture([])
-        self.assertNotIn("Выбрасываемые интервалы", out, out[:400])
+        out, log = self.capture([])
+        self.assertNotIn("Выбрасываемые интервалы", log, log)
 
     def test_dropped_interval_not_counted_in_plan_credits(self):
         self.seed_row(tokens=5000000, attribution="gap", note="интервал 2400 с")
-        out = self.capture([])
-        self.assertIn("Строк плана в окне нет", out, out[:400])
+        out, log = self.capture([])
+        self.assertTrue(out.splitlines()[0].startswith("Равно 0.0%"),
+                        f"выбрасываемый интервал попал в кредиты плана: {out!r}")
 
-    def test_shape_plan_first(self):
-        self.seed_window()
-        out = self.capture([])
-        first = out.splitlines()[0]
-        self.assertTrue(first.startswith("Равно"), f"первая строка не про план: {first!r}")
-        self.assertIn("на Z.ai", first)
-        for line in ("Эквивалентный кодовый план z.ai", "курс взят из «Плати по миру»"):
-            self.assertIn(line, out)
-        # расчёт токенов — частный случай: план не переполнен, поэтому он не печатается
-        self.assertIn("Расчёт токенов не применяется", out)
-        self.assertNotIn("Сэкономлено за последние сутки", out)
-
-    def test_dry_run_writes_nothing(self):
-        out = self.capture(["--dry-run"])
-        self.assertIn("тест без сети", out)
-        self.assertFalse(os.path.exists(self.C.LEDGER), "dry-run записал копилку")
-        self.assertFalse(os.path.exists(self.C.SNAP), "dry-run записал снимок")
-        self.assertFalse(os.path.exists(self.T.DB), "dry-run создал базу")
-
-    def test_tick_is_silent(self):
-        out = self.capture(["--tick"])
-        self.assertEqual(out, "", f"tick печатает: {out!r}")
-        self.assertTrue(os.path.exists(self.T.DB), "tick не записал запуск в базу")
-        con = sqlite3.connect(self.T.DB)
-        self.assertEqual(con.execute("SELECT job FROM runs").fetchone()[0], "tick")
-
-    def test_zai_block_separates_plan_and_paid(self):
-        # строка переполняет каскад — включается частный случай с расчётом токенов
-        self.seed_row(tokens=7000000000)
-        rows = [("s1", "glm", "zai", "https://api.z.ai", "", "chat", 7000000000, 0, 0, 0, 100, 100),
-                ("s2", "glm", "zai", "https://api.z.ai", "", "chat", 1200000, 0, 0, 0.42, 100, 100)]
-        out = self.capture([], rows=rows)
-        self.assertIn("оплаченные", out, f"блок z.ai не различает план и оплату: {out}")
-        self.assertIn("Не учтено (z.ai coding plan): 7000.00M", out, out)
-        self.assertIn("1.20M", out, out)
-
-    def test_max_overflow_prints_token_calculation_on_overflow_only(self):
-        """Частный случай: когда каскад переполнен, прежний расчёт токенов включается,
-        но показывает только число переполнения (вычет суммарного лимита Light+Pro+Max),
-        а не общее количество токенов."""
+    def test_max_overflow_delivers_token_version(self):
+        """Частный случай: каскад переполнен — доставляется прежняя версия про токены,
+        и только переполнение, а не общее количество токенов."""
         import plan_core as PC
         start, end = self.seed_row(tokens=7000000000)
-        out = self.capture([])
-        self.assertIn("План Max переполнен, переходим на пересчет токенов.", out)
-        self.assertIn("Пересчёт токенов — только переполнение Max", out)
-        # ожидание считается тем же модельным рядом на том же окне строки:
-        # доля пика зависит от того, когда запущен тест
-        day = datetime.fromtimestamp(end, PC.PEAK_TZ).date()
-        share = PC.DayIntegralPeakModel().share(day, start, end)
-        base = 7000000000 * 2.3 / 10000
-        credits = base * (share + (1.0 - share) * PC.OFFPEAK_FACTOR)
-        frac = (credits - 930000) / credits
-        expected = 7000000000 * frac
-        self.assertIn(f"{expected/1e6:.2f}M", out,
-                      f"переполнение не равно ожидаемому {expected/1e6:.2f}M (день {day}, доля {share}): {out}")
-        # общее количество токенов показывать нельзя — только переполнение
-        # (блок плана называет полный объём окна — это его норма; проверяем
-        # именно блок пересчёта токенов)
-        tail = out.split("Пересчёт токенов", 1)[1]
-        self.assertNotIn("7000.00M", tail,
-                         f"блок пересчёта показывает общее количество токенов: {tail}")
-
-    def test_paid_rows_do_not_enter_the_overflow_split(self):
-        """Баг M1 в частном случае: оплаченные z.ai не участвуют в расщеплении
-        по лимитам каскада — переполнение считается только по плановым строкам."""
-        import plan_core as PC
-        start, end = self.seed_row(tokens=7000000000)
-        self.seed_row(tokens=2000000, plan_class="zai_paid")
-        out = self.capture([])
+        out, log = self.capture([])
+        self.assertIn("Сравнительная цена токенов — только локальные LLM", out, out)
+        self.assertIn("Работа аналогичного агента на GLM-5.3-Flash за последние сутки:", out, out)
+        self.assertIn("переполнение Max", out, out)
         day = datetime.fromtimestamp(end, PC.PEAK_TZ).date()
         share = PC.DayIntegralPeakModel().share(day, start, end)
         base = 7000000000 * 2.3 / 10000
         credits = base * (share + (1.0 - share) * PC.OFFPEAK_FACTOR)
         expected = 7000000000 * (credits - 930000) / credits
-        tail = out.split("Пересчёт токенов", 1)[-1]
+        self.assertIn(f"{expected/1e6:.2f}M", out,
+                      f"переполнение не равно ожидаемому {expected/1e6:.2f}M: {out}")
+        tail = out.split("переполнение Max", 1)[1]
+        self.assertNotIn("7000.00M", tail,
+                         f"блок пересчёта показывает общее количество токенов: {tail}")
+
+    def test_paid_rows_do_not_enter_the_overflow_split(self):
+        import plan_core as PC
+        start, end = self.seed_row(tokens=7000000000)
+        self.seed_row(tokens=2000000, plan_class="zai_paid")
+        out, log = self.capture([])
+        day = datetime.fromtimestamp(end, PC.PEAK_TZ).date()
+        share = PC.DayIntegralPeakModel().share(day, start, end)
+        base = 7000000000 * 2.3 / 10000
+        credits = base * (share + (1.0 - share) * PC.OFFPEAK_FACTOR)
+        expected = 7000000000 * (credits - 930000) / credits
+        tail = out.split("переполнение Max", 1)[-1]
         self.assertIn(f"{expected/1e6:.2f}M", tail,
                       f"оплаченная строка попала в расщепление: {tail[:200]}")
-        self.assertIn("Оплаченные z.ai в окне", out,
-                      f"оплаченные не названы отдельной строкой: {out[:300]}")
+        self.assertIn("оплаченные", out, f"оплаченные не названы: {out[:300]}")
 
-    def test_plan_transition_message_printed_once(self):
-        """Переход Light -> Pro сообщается один раз: состояние плана обновляется
-        и в основной ветке (не только в ветке переполнения Max)."""
-        # строка, которая переполняет месячный лимит Light (~44285.7 кредитов)
+    def test_plan_state_updated_once(self):
+        """Переход плана не печатается в сообщение: доставляется ровно две строки,
+        состояние обновляется один раз."""
         self.seed_row(tokens=400000000)
-        out1 = self.capture([])
-        self.assertIn("Превышен план Light, перешли на Pro", out1, out1)
+        out1, log1 = self.capture([])
+        self.assertIn("Pro", out1.splitlines()[0], out1)
         with open(os.path.join(self.T.STATE, "token_cost_plan.json"), encoding="utf-8") as f:
             st = json.load(f)
         self.assertEqual(st.get("plan"), "pro", f"состояние плана не обновлено: {st}")
-        out2 = self.capture([])
-        self.assertNotIn("Превышен план", out2,
-                         f"переход сообщается повторно на каждом запуске: {out2}")
+        out2, log2 = self.capture([])
+        self.assertEqual(len(out2.splitlines()), 2, f"доставляется не две строки: {out2!r}")
+        self.assertNotIn("Превышен план", out2, f"переход печатается в сообщение: {out2!r}")
 
-    def test_report_includes_plan_block(self):
-        self.seed_window()
-        out = self.capture([])
-        self.assertIn("Эквивалентный кодовый план z.ai", out, out)
-        self.assertIn("использовано", out, out)
-        self.assertIn("Light плана", out, out)
-        self.assertIn("месячного лимита", out, out)
-        # месячного лимита на сайте нет — блок обязан называть, что он выведен
-        self.assertIn("только 5-часовой и недельный", out, out)
-        self.assertIn("MCP-вызовы", out, out)
+    def test_dry_run_writes_nothing(self):
+        out, log = self.capture(["--dry-run"])
+        self.assertEqual(len(out.splitlines()), 2, out)
+        self.assertFalse(os.path.exists(self.C.LEDGER), "dry-run записал копилку")
+        self.assertFalse(os.path.exists(self.C.SNAP), "dry-run записал снимок")
+        self.assertFalse(os.path.exists(self.T.DB), "dry-run создал базу")
 
-    def test_dry_run_plan_block_writes_no_state(self):
-        out = self.capture(["--dry-run"])
-        self.assertIn("Эквивалентный кодовый план z.ai", out, out)
-        # dry-run не создаёт базу: блок обязан честно назвать, что кредиты не считались,
-        # и всё равно печатать заголовок и оговорку о выводе месячного лимита
-        self.assertIn("не посчитан", out, out)
-        self.assertIn("только 5-часовой и недельный", out, out)
-        self.assertFalse(os.path.exists(os.path.join(self.home, ".hermes", "state",
-                                                     "token_cost_plan.json")),
-                         "dry-run создал файл состояния плана")
+    def test_dry_run_names_uncalculated_credits_in_the_log(self):
+        out, log = self.capture(["--dry-run"])
+        self.assertIn("не посчитан", log, f"dry-run молчит о том, что кредиты не считались: {out!r}")
+        self.assertNotIn("не посчитан", out, out)
 
-    def test_hours_line_not_mislabelled_without_commit_run(self):
-        # строка 'с 21:00' существует только в частном случае (переполнение Max)
+    def test_tick_is_silent(self):
+        out, log = self.capture(["--tick"])
+        self.assertEqual(out, "", f"tick печатает: {out!r}")
+        self.assertTrue(os.path.exists(self.T.DB), "tick не записал запуск в базу")
+        con = sqlite3.connect(self.T.DB)
+        self.assertEqual(con.execute("SELECT job FROM runs").fetchone()[0], "tick")
+
+    def test_hours_line_only_in_overflow_case(self):
         self.seed_row(tokens=7000000000)
-        out = self.capture([])
-        self.assertIn("запуска 21:00 ещё нет", out,
-                      f"строка 'с 21:00' печатается без запуска 21:00 — метка врёт: {out}")
-
-    def test_anomalies_reported(self):
-        self.seed_row(model="m", plan_class="local", tokens=0, attribution="anomaly",
-                      note="строка уменьшилась")
-        out = self.capture([])
-        self.assertIn("Anomaly-строки", out, f"anomaly не показаны в отчёте: {out}")
-
-    def test_unknown_plan_noted(self):
-        self.seed_row(model="m", plan_class="unknown")
-        out = self.capture([])
-        self.assertIn("plan unknown", out, f"незаписанный провайдер не отражён: {out}")
+        out, log = self.capture([])
+        self.assertIn("запуска 21:00 ещё нет", out, f"строка 'с 21:00' пропала: {out}")
 
     def test_db_failure_degrades_honestly(self):
-        """База заблокирована/недоступна — отчёт всё равно должен выйти и честно
-        сказать, что план не посчитан, а не упасть."""
+        """База заблокирована — сообщение всё равно выходит (две строки), а проблема
+        называется в логе, а не в сообщении."""
         def boom(*a, **k):
             raise sqlite3.OperationalError("database is locked")
         self.T.connect = boom
-        out = self.capture([])
-        self.assertIn("не посчитан", out, f"деградация базы не показана: {out}")
-        self.assertIn("database is locked", out, out)
-        self.assertIn("Эквивалентный кодовый план z.ai", out,
-                      f"отчёт без базы должен начинаться с блока плана: {out}")
+        out, log = self.capture([])
+        self.assertEqual(len(out.splitlines()), 2, f"сообщение без базы не вышло: {out!r}")
+        self.assertIn("database is locked", log, f"деградация базы не названа в логе: {log!r}")
 
     def test_fresh_install_creates_state_dir(self):
-        """Чистая установка: каталога ~/.hermes/state может не быть — первый запуск
-        не должен падать с FileNotFoundError."""
-        out = self.capture([])
-        self.assertIn("Эквивалентный кодовый план z.ai", out)
+        out, log = self.capture([])
+        self.assertEqual(len(out.splitlines()), 2, out)
         self.assertTrue(os.path.isdir(os.path.dirname(self.C.LEDGER)), "state/ не создан")
         self.assertTrue(os.path.exists(self.C.LEDGER), "копилка не создана")
 

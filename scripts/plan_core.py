@@ -645,6 +645,17 @@ class PlanReport:
     def paid_rows(self, rows):
         return [r for r in rows if r["plan_class"] == PAID_CLASS]
 
+    def delivered(self, rows=None, credits=None):
+        """Доставляемый блок — ровно две строки: процент плана и строка про
+        эквивалентный план. Оговорки (окно, лимит, модель пика, backfill, unknown, MCP)
+        — это размышления: они не доставляются. Они остаются в базе и восстанавливаются
+        запросом, но в сообщении их быть не должно (правило пользователя)."""
+        rows = self.rows() if rows is None else rows
+        credits = self.credits(rows) if credits is None else credits
+        return [self.first_line(credits),
+                "Эквивалентный кодовый план z.ai (эквивалентная модель %s)"
+                % self.multipliers.fallback_model()]
+
     def build(self, rows=None, credits=None):
         rows = self.rows() if rows is None else rows
         # кредиты считаются ДО использования: иначе ветка «строк нет» падает,
