@@ -110,6 +110,13 @@ def main():
     check("setup.sh отвергает некорректный день и оставляет значение по умолчанию",
           "не понял" in out and saved["anchor_date"] != "abc", out[:160])
     check("setup.sh создаёт state/", os.path.isdir(state))
+    # доставка одного сообщения: файл обязан быть в репо — SKILL.md ссылается на
+    # него как на шаг доставки, и на машине коллеги без него шаг не работает
+    check("single_message.py лежит в репо навыка",
+          os.path.exists(os.path.join(skill, "scripts", "single_message.py")),
+          "нет файла в репо — доставка одного сообщения невоспроизводима")
+    check("single_message.py скопирован в ~/.hermes/scripts",
+          os.path.exists(os.path.join(scripts, "single_message.py")), "крон исполняет только оттуда")
     check("setup.sh предлагает выбрать день начала подписки",
           "--set-anchor" in out and "начал" in out.lower(), out.strip()[:160])
 
@@ -224,7 +231,7 @@ def main():
     check("z.ai разделён на план и оплату", "оплаченные" in tail, tail[:160])
 
     # 11. тесты навыка на чистой копии
-    for tf in ("test_plan_core.py", "test_plan_usage.py", "test_token_cost.py"):
+    for tf in ("test_plan_core.py", "test_plan_usage.py", "test_token_cost.py", "test_single_message.py"):
         r = subprocess.run([PY, os.path.join(skill, "tests", tf)],
                            capture_output=True, text=True, env={**os.environ, "HOME": HOME}, timeout=300)
         check(f"тесты навыка на чистой копии ({tf})", r.returncode == 0,
