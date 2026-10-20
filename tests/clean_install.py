@@ -83,6 +83,22 @@ def main():
     # 2. setup.sh
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"))
     check("setup.sh проходит", rc == 0, (err or out).strip()[:160])
+
+    # M3: существующие скрипты не перезаписываются молча — крон исполняет копию
+    # в ~/.hermes/scripts/, и тихая перезапись меняет поведение живого крона
+    scripts_dir = os.path.join(HOME, ".hermes", "scripts")
+    stale = os.path.join(scripts_dir, "token_cost.py")
+    with open(stale, "w", encoding="utf-8") as f:
+        f.write("# прежняя версия на машине коллеги\n")
+    rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"))
+    kept = open(stale, encoding="utf-8").read().strip()
+    check("setup.sh предупреждает и НЕ перезаписывает отличающийся файл",
+          "ВНИМАНИЕ" in out and kept == "# прежняя версия на машине коллеги",
+          out[:160])
+    rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "--force")
+    check("setup.sh --force перезаписывает осознанно",
+          open(stale, encoding="utf-8").read().strip() != "# прежняя версия на машине коллеги",
+          out[:160])
     check("setup.sh создаёт state/", os.path.isdir(state))
     check("setup.sh предлагает выбрать день начала подписки",
           "--set-anchor" in out and "начал" in out.lower(), out.strip()[:160])
