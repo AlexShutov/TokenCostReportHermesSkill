@@ -375,6 +375,19 @@ class SourceBranches(unittest.TestCase):
     def setUp(self):
         self.window = P.MonthWindow(date(2026, 10, 19))
 
+    def test_both_source_paths_return_the_same_shape(self):
+        """Один контракт для обоих путей источника: раньше in-memory возвращал число,
+        путь базы — словарь, и отчёт падал на пути базы (именно он работает на живом
+        прогоне). Замер: одинаковые строки — одинаковая форма и одинаковое значение."""
+        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "gap",
+                    ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 30000, 10000, 10000)]
+        con = fake_db(rows)
+        mem = P.InMemoryIncrementSource(rows).gaps(self.window)
+        db = P.SqliteIncrementSource(lambda: con).gaps(self.window)
+        self.assertIsInstance(db[1], (int, float), "путь базы вернул другую форму")
+        self.assertEqual(mem, db, "пути разошлись")
+        con.close()
+
     def test_local_gap_not_counted_by_db_path(self):
         """Оценка плана считает только плановые строки: без фильтра по плану в счёт
         выбрасываемых интервалов попадали локальные. Замер: локальный gap 50000 —
@@ -384,7 +397,7 @@ class SourceBranches(unittest.TestCase):
         con = fake_db(rows)
         n, tok = P.SqliteIncrementSource(lambda: con).gaps(self.window)
         self.assertEqual(n, 0, "локальный интервал посчитан как интервал плана")
-        self.assertEqual(sum(tok.values()), 0)
+        self.assertEqual(tok, 0)
         con.close()
 
     def test_single_definition_of_excluded_rows_in_both_paths(self):

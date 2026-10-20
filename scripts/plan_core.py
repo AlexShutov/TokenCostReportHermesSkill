@@ -334,7 +334,9 @@ class SqliteIncrementSource(IncrementSource):
                 "AND plan_class IN (" + ph + ") AND window_end>=? AND window_start<=?",
                 list(self._plan_classes) + [window.start.timestamp(), window.end.timestamp()])
             r = cur.fetchone()
-            return (r[0], {"input": r[1], "cached": r[2], "output": r[3]})
+            # форма возврата обязана совпадать с контрактом и с in-memory-путём:
+            # раньше один путь отдавал число, другой словарь, и отчёт ломался на втором
+            return (r[0], (r[1] or 0) + (r[2] or 0) + (r[3] or 0))
         finally:
             con.close()
 
