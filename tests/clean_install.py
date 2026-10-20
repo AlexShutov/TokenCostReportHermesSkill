@@ -197,7 +197,10 @@ def main():
     check("ошибка запуска сообщается строкой, а не молчит",
           "база заблокирована" in mod.run("", chat=CHAT, spawn=err_spawn), "")
     # ветка без HERMES_HOME — обычный случай на машине коллеги: путь обязан
-    # решаться от домашнего каталога пользователя, а не от пути автора
+    # решаться от домашнего каталога пользователя, а не от пути автора.
+    # Подменять надо и HOME процесса: без этого тест читает домашний каталог автора
+    real_home = os.environ.get("HOME") or ""
+    os.environ["HOME"] = HOME
     os.environ.pop("HERMES_HOME", None)
     spec2 = importlib.util.spec_from_file_location("tcr_clean_plugin_fresh",
                                                    os.path.join(plug_dir, "__init__.py"))
@@ -206,6 +209,7 @@ def main():
     check("без HERMES_HOME путь решается от HOME пользователя",
           mod2.SCRIPT == os.path.join(HOME, ".hermes", "scripts", "token_cost_commit.py"),
           mod2.SCRIPT)
+    os.environ["HOME"] = real_home
     check("single_message.py скопирован в ~/.hermes/scripts",
           os.path.exists(os.path.join(scripts, "single_message.py")), "крон исполняет только оттуда")
     check("setup.sh предлагает выбрать день начала подписки",
