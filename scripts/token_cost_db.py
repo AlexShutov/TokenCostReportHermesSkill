@@ -19,6 +19,8 @@
 import json, os, sqlite3, time
 from datetime import datetime, timezone
 
+import attributions as A          # одни общие определения атрибуций для базы и ядра плана
+
 STATE = os.path.expanduser("~/.hermes/state")
 DB = os.path.join(STATE, "token_cost.db")
 SRC = os.path.expanduser("~/.hermes/state.db")
@@ -188,6 +190,13 @@ def record_run(con, job, cron_job, profile, session_id, prices, rate, rate_sourc
             w0, w1 = prev[3], t
             if any(x < 0 for x in d):
                 a, note, d = "anomaly", "строка уменьшилась (сессия удалена) — не входит в суммы", (0, 0, 0)
+            elif w1 - w0 > A.MAX_WINDOW_SECONDS:
+                # Крон-задача не сработала, машина спала или агент завис: токены за
+                # интервал реальны, но разложить их по времени нельзя — весь прирост
+                # ушёл бы в день window_end и исказил «по дням». Интервал выбрасывается
+                # из сумм, но строка остаётся в базе (append-only).
+                a, note = "gap", ("интервал наблюдения %d с больше порога %d с — выбрасывается из сумм"
+                                  % (w1 - w0, A.MAX_WINDOW_SECONDS))
             else:
                 a, note = "delta", None
 
@@ -217,31 +226,43 @@ def record_run(con, job, cron_job, profile, session_id, prices, rate, rate_sourc
 
 
 def window_sum(con, plan, start, end):
-    """Сумма инкрементов за временное окно (anomaly-строки не входят)."""
+    """Сумма инкрементов за временное окно (исключённые атрибуции не входят)."""
     q = ("SELECT COALESCE(SUM(input_delta),0), COALESCE(SUM(cache_delta),0), "
-         "COALESCE(SUM(output_delta),0) FROM increments WHERE attribution<>'anomaly' "
-         "AND plan_class=? AND window_end>=? AND window_start<=?")
-    return con.execute(q, (plan, start, end)).fetchone()
+         "COALESCE(SUM(output_delta),0) FROM increments WHERE " + A.excluded_sql() +
+         " AND plan_class=? AND window_end>=? AND window_start<=?")
+    return con.execute(q, list(A.EXCLUDED_ATTRIBUTION) + [plan, start, end]).fetchone()
 
 
 def session_sum(con, session_id, plan=None):
     q = ("SELECT COALESCE(SUM(input_delta),0), COALESCE(SUM(cache_delta),0), "
-         "COALESCE(SUM(output_delta),0) FROM increments WHERE attribution<>'anomaly' "
-         "AND session_id=?" + (" AND plan_class=?" if plan else ""))
-    args = (session_id,) + ((plan,) if plan else ())
+         "COALESCE(SUM(output_delta),0) FROM increments WHERE " + A.excluded_sql() +
+         " AND session_id=?" + (" AND plan_class=?" if plan else ""))
+    args = list(A.EXCLUDED_ATTRIBUTION) + [session_id] + ([plan] if plan else [])
     return con.execute(q, args).fetchone()
 
 
 def daily(con, plan, limit=4):
     q = ("SELECT date(window_end,'unixepoch','localtime') d, SUM(input_delta), SUM(cache_delta), "
-         "SUM(output_delta) FROM increments WHERE attribution<>'anomaly' AND plan_class=? "
+         "SUM(output_delta) FROM increments WHERE " + A.excluded_sql() + " AND plan_class=? "
          "GROUP BY d ORDER BY d DESC LIMIT ?")
-    return con.execute(q, (plan, limit)).fetchall()
+    return con.execute(q, list(A.EXCLUDED_ATTRIBUTION) + [plan, limit]).fetchall()
 
 
 def anomalies(con, limit=10):
     return con.execute("SELECT run_at, session_id, model, plan_class, note FROM increments "
                        "WHERE attribution='anomaly' ORDER BY run_epoch DESC LIMIT ?", (limit,)).fetchall()
+
+
+def gaps(con, limit=10):
+    """Выбрасываемые интервалы: токены реальны, но время не атрибутируется."""
+    return con.execute("SELECT run_at, session_id, model, plan_class, window_end - window_start, note "
+                       "FROM increments WHERE attribution='gap' ORDER BY run_epoch DESC LIMIT ?",
+                       (limit,)).fetchall()
+
+
+def gap_tokens(con):
+    return con.execute("SELECT COUNT(*), COALESCE(SUM(input_delta),0), COALESCE(SUM(cache_delta),0), "
+                       "COALESCE(SUM(output_delta),0) FROM increments WHERE attribution='gap'").fetchone()
 
 
 if __name__ == "__main__":

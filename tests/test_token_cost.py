@@ -138,6 +138,66 @@ class Increments(Case):
         self.assertEqual(con.execute("SELECT SUM(input_delta) FROM increments").fetchone()[0], 1000,
                          "отрицательный прирост попал в суммы")
 
+    def test_window_over_threshold_is_gap_and_excluded(self):
+        """Баг: длинный интервал между наблюдениями (крон не сработал, машина спала,
+        агент завис) атрибутировался целиком днём window_end и искажал «по дням».
+        Теперь такой интервал выбрасывается из сумм, но строка остаётся в базе."""
+        rows = [("s1", "qwen", "custom", "http://x", "", "chat", 1000, 0, 0, 0, 100, 100)]
+        self.run_record(rows)
+        con = self.T.connect()
+        con.execute("UPDATE usage_snapshot SET run_epoch = run_epoch - 2400")   # 40 минут назад
+        con.commit()
+        con.close()
+        rows2 = [("s1", "qwen", "custom", "http://x", "", "chat", 1100, 0, 0, 0, 100, 2500)]
+        (rid, added), con = self.run_record(rows2)
+        a = con.execute("SELECT attribution FROM increments WHERE run_id=?", (rid,)).fetchone()[0]
+        self.assertEqual(a, "gap", f"интервал длиннее порога не выброшен: {a}")
+        now = time.time() + 10
+        self.assertEqual(self.T.window_sum(con, "local", 0, now)[0], 1000,
+                         "выбрасываемый интервал попал в суточное окно")
+        self.assertEqual(self.T.session_sum(con, "s1", "local")[0], 1000,
+                         "выбрасываемый интервал попал в сессионную сумму")
+        day = self.T.daily(con, "local")[0]
+        self.assertEqual(day[1], 1000, "выбрасываемый интервал попал в «по дням»")
+        self.assertEqual(con.execute("SELECT input_delta FROM increments WHERE run_id=?",
+                                     (rid,)).fetchone()[0],
+                         100, "append-only: строка выбрасывается из сумм, но обязана остаться в базе")
+        con.close()
+
+    def test_window_under_threshold_stays_delta(self):
+        rows = [("s1", "qwen", "custom", "http://x", "", "chat", 1000, 0, 0, 0, 100, 100)]
+        self.run_record(rows)
+        rows2 = [("s1", "qwen", "custom", "http://x", "", "chat", 1100, 0, 0, 0, 100, 101)]
+        (rid, added), con = self.run_record(rows2)
+        a = con.execute("SELECT attribution FROM increments WHERE run_id=?", (rid,)).fetchone()[0]
+        self.assertEqual(a, "delta", f"нормальный интервал ошибочно выброшен: {a}")
+        self.assertEqual(self.T.window_sum(con, "local", 0, time.time() + 10)[0], 1100,
+                         "нормальный интервал не попал в суммы")
+        con.close()
+
+    def test_threshold_is_configurable_by_env(self):
+        import importlib, attributions as A
+        os.environ["TOKEN_COST_MAX_WINDOW"] = "5"
+        try:
+            A2 = importlib.reload(A)
+            self.assertEqual(A2.MAX_WINDOW_SECONDS, 5, "порог не читается из переменной")
+            rows = [("s1", "qwen", "custom", "http://x", "", "chat", 1000, 0, 0, 0, 100, 100)]
+            self.run_record(rows)
+            con = self.T.connect()
+            con.execute("UPDATE usage_snapshot SET run_epoch = run_epoch - 60")
+            con.commit()
+            con.close()
+            (rid, added), con = self.run_record(
+                [("s1", "qwen", "custom", "http://x", "", "chat", 1100, 0, 0, 0, 100, 160)])
+            a = con.execute("SELECT attribution FROM increments WHERE run_id=?", (rid,)).fetchone()[0]
+            self.assertEqual(a, "gap", f"порог из переменной не применён: {a}")
+            self.assertEqual(self.T.window_sum(con, "local", 0, time.time() + 10)[0], 1000,
+                         "порог из переменной не применяется к суммам")
+            con.close()
+        finally:
+            os.environ.pop("TOKEN_COST_MAX_WINDOW", None)
+            importlib.reload(A)
+
     def test_disappeared_row_recorded_as_anomaly(self):
         """Строка, которая исчезла между запусками (сессия удалена), должна попасть
         в базу как anomaly — иначе база никогда не видит удаление, а SKILL.md обещает."""

@@ -375,6 +375,27 @@ class SourceBranches(unittest.TestCase):
     def setUp(self):
         self.window = P.MonthWindow(date(2026, 10, 19))
 
+    def test_gaps_are_counted_and_named(self):
+        src = P.InMemoryIncrementSource([row("glm-5.3-flash", "zai_plan_by_rule", "gap",
+                                             ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 50000)])
+        n, tok = src.gaps(self.window)
+        self.assertEqual((n, tok), (1, 50000), "выбрасываемые интервалы не называются")
+        rep = P.PlanReport(self.window, P.PlanCascade(P.PlanRegistry(), self.window),
+                           P.StandardCreditCalculator(), P.MultiplierRegistry(), P.PlanRegistry(),
+                           P.DayIntegralPeakModel(), state={}, source=src)
+        out = rep.build()
+        self.assertTrue(any("Выбрасываемые интервалы" in l for l in out), out)
+        self.assertTrue(any("TOKEN_COST_MAX_WINDOW" in l for l in out), out)
+
+    def test_no_gap_line_when_there_are_no_gaps(self):
+        src = P.InMemoryIncrementSource([row("glm-5.3-flash", "zai_plan_by_rule", "delta",
+                                             ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 10000)])
+        rep = P.PlanReport(self.window, P.PlanCascade(P.PlanRegistry(), self.window),
+                           P.StandardCreditCalculator(), P.MultiplierRegistry(), P.PlanRegistry(),
+                           P.DayIntegralPeakModel(), state={}, source=src)
+        out = rep.build()
+        self.assertFalse(any("Выбрасываемые интервалы" in l for l in out), out)
+
     def test_before_window_counts_rows_outside(self):
         before = row("glm-5.3-flash", "zai_plan_by_rule", "delta",
                      ts(2026, 10, 13, 10), ts(2026, 10, 13, 11), 10000)

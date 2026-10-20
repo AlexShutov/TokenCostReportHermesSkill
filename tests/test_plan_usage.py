@@ -141,7 +141,8 @@ class Python3Only(Case):
             if m:
                 name = m.group(1)
                 self.assertIn(name, {"json", "os", "sqlite3", "sys", "datetime", "calendar",
-                                     "abc", "typing", "token_cost", "token_cost_db", "plan_core"},
+                                     "abc", "typing", "token_cost", "token_cost_db", "plan_core",
+                                     "attributions"},
                                 "импорт не из stdlib: %s" % name)
 
 

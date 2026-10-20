@@ -37,6 +37,8 @@ from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
+import attributions as A          # одни общие определения атрибуций (база и ядро плана)
+
 PEAK_TZ = timezone(timedelta(hours=8))          # Singapore Standard Time
 PEAK_DAYS = (0, 1, 2, 3, 4)                     # пн-пт
 PEAK_START, PEAK_END = 14, 18
@@ -247,6 +249,12 @@ class IncrementSource(ABC):
         месячному окну и в оценку не входят — блок обязан это назвать."""
         return (0, 0)
 
+    def gaps(self, window) -> tuple:
+        """Выбрасываемые интервалы окна: (число, токены). Токены за них реальны, но
+        время не атрибутируется, поэтому в оценку они не входят — блок обязан это
+        назвать, иначе цифра выглядит как полная."""
+        return (0, 0)
+
 
 class InMemoryIncrementSource(IncrementSource):
     def __init__(self, rows):
@@ -265,6 +273,14 @@ class InMemoryIncrementSource(IncrementSource):
 
     def before_window(self, window):
         rows = [r for r in self._rows if r["window_end"] < window.start.timestamp()]
+        tot = zero_tokens()
+        for r in rows:
+            add_tokens(tot, r["tokens"])
+        return (len(rows), sum(tot.values()))
+
+    def gaps(self, window):
+        rows = [r for r in self._rows if r["attribution"] == "gap"
+                and window.contains(r["window_end"])]
         tot = zero_tokens()
         for r in rows:
             add_tokens(tot, r["tokens"])
@@ -303,6 +319,18 @@ class SqliteIncrementSource(IncrementSource):
                 "SELECT COUNT(*) FROM increments WHERE attribution='anomaly' "
                 "AND window_end>=? AND window_start<=?",
                 (window.start.timestamp(), window.end.timestamp())).fetchone()[0]
+        finally:
+            con.close()
+
+    def gaps(self, window):
+        con = self._conn_factory()
+        try:
+            r = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(input_delta),0), COALESCE(SUM(cache_delta),0), "
+                "COALESCE(SUM(output_delta),0) FROM increments WHERE attribution='gap' "
+                "AND window_end>=? AND window_start<=?",
+                (window.start.timestamp(), window.end.timestamp())).fetchone()
+            return (r[0], {"input": r[1], "cached": r[2], "output": r[3]})
         finally:
             con.close()
 
@@ -597,6 +625,8 @@ class PlanReport:
         for r in rows:
             if r["plan_class"] == PAID_CLASS:
                 continue          # оплаченные z.ai — не план, в процент не входит
+            if r["attribution"] in A.EXCLUDED_ATTRIBUTION:
+                continue          # anomaly и выбрасываемый интервал — не входят в суммы
             day = datetime.fromtimestamp(r["window_end"], PEAK_TZ).date()
             mult = (self.multipliers.for_model(r["model"]) if self.by_actual
                     else self.multipliers.for_model(self.multipliers.fallback_model()))
@@ -675,6 +705,13 @@ class PlanReport:
         if n_anom:
             lines.append("Anomaly-строки в окне: %d — они не входят в суммы (строка уменьшилась или "
                          "исчезла между наблюдениями), но остаются в базе" % n_anom)
+        if self.source is not None:
+            n_gap, tok = self.source.gaps(self.window)
+            if n_gap:
+                lines.append("Выбрасываемые интервалы в окне: %d (%.2fM токенов) — длиннее порога %d мин "
+                             "(крон не сработал, машина спала, агент завис): токены реальны, но время "
+                             "за них не атрибутируется, поэтому в оценку они не входят; порог — "
+                             "переменная TOKEN_COST_MAX_WINDOW" % (n_gap, tok / 1e6, A.MAX_WINDOW_SECONDS // 60))
         if self.source is not None:
             n_before, tok_before = self.source.before_window(self.window)
             if n_before:
