@@ -83,6 +83,7 @@ def main():
     # 2. setup.sh
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"))
     check("setup.sh проходит", rc == 0, (err or out).strip()[:160])
+    first_out = out
 
     # M3: существующие скрипты не перезаписываются молча — крон исполняет копию
     # в ~/.hermes/scripts/, и тихая перезапись меняет поведение живого крона
@@ -103,7 +104,10 @@ def main():
           after_force != "# прежняя версия на машине коллеги",
           out[:160])
 
-    # M4: некорректный день не должен молча записываться в состояние
+    # M4: некорректный день не должен молча записываться в состояние.
+    # Проверка идёт на свежем состоянии: повторный запуск больше не пишет файл
+    # (это отдельная проверка ниже), иначе тут сработал бы guard, а не валидатор.
+    os.remove(os.path.join(state, "token_cost_plan.json"))
     rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "abc")
     with open(os.path.join(state, "token_cost_plan.json"), encoding="utf-8") as f:
         saved = json.load(f)
@@ -126,7 +130,7 @@ def main():
     check("single_message.py скопирован в ~/.hermes/scripts",
           os.path.exists(os.path.join(scripts, "single_message.py")), "крон исполняет только оттуда")
     check("setup.sh предлагает выбрать день начала подписки",
-          "--set-anchor" in out and "начал" in out.lower(), out.strip()[:160])
+          "--set-anchor" in first_out and "начал" in first_out.lower(), first_out.strip()[:160])
 
     # 3. скрипты в ~/.hermes/scripts (крон исполняет только оттуда)
     os.makedirs(scripts, exist_ok=True)
@@ -153,28 +157,36 @@ def main():
     check("dry-run ничего не записал", not os.path.exists(os.path.join(state, "token_cost.db"))
           and not os.path.exists(os.path.join(state, "token_cost_ledger.json")),
           "после dry-run в state/ нет ни базы, ни копилки")
-    check("формат отчёта начинается с оценки плана",
-          out.splitlines()[0].startswith("Равно") and "на Z.ai" in out
-          and "курс взят из «Плати по миру»" in out, out.splitlines()[0])
-    check("расчёт токенов — частный случай: при незаполненном плане не печатается",
-          "Расчёт токенов не применяется" in out and "Сэкономлено за последние сутки" not in out,
-          out.splitlines()[0])
+    check("доставляемое сообщение — ровно две строки (правило пользователя)",
+          len(out.splitlines()) == 2 and out.splitlines()[0].startswith("Равно")
+          and "на Z.ai" in out.splitlines()[0]
+          and "Эквивалентный кодовый план z.ai" in out.splitlines()[1], out[:120])
+    check("частный случай: при незаполненном плане расчёт токенов не доставляется",
+          "Сэкономлено за последние сутки" not in out, out[:120])
 
     # 7. тик через обёртку (именно так его зовёт крон): молчит, пишет run
     rc, out, err = run(os.path.join(scripts, "token_cost_tick.py"))
     check("тик через обёртку молчит", rc == 0 and out == "", repr(out[:80]))
     db = os.path.join(state, "token_cost.db")
     check("тик создал базу во временном HOME", os.path.exists(db), db)
+    # оговорки — это лог: в сообщение они не входят и остаются в базе
+    rc, out, err = run(os.path.join(scripts, "token_cost.py"))
+    check("оговорки не входят в сообщение, но остаются в логе",
+          len(out.splitlines()) == 2 and "Суточное окно" in err
+          and "Месячный лимит" in err and "MCP-вызовы" in err, err[:160])
     if os.path.exists(db):
         con = sqlite3.connect(db)
-        row = con.execute("SELECT job, cron_job, profile FROM runs ORDER BY run_id DESC LIMIT 1").fetchone()
+        row = con.execute("SELECT job, cron_job, profile FROM runs WHERE job='tick' ORDER BY run_id DESC LIMIT 1").fetchone()
         check("тик записал job/cron_job", row and row[0] == "tick" and row[1] == "token-counter", str(row))
         check("профиль взят из jobs.json", row and row[2] == "colleague", str(row))
         con.close()
 
     # 8. обёртка commit (крон 21:00)
     rc, out, err = run(os.path.join(scripts, "token_cost_commit.py"))
-    check("commit-обёртка прошла", rc == 0, (err or "").strip()[:160])
+    # в тестовом HOME нет токена Bot API: доставка обязана отказаться честно,
+    # но расчёт и снимок 21:00 при этом выполняются — навык работает без LLM
+    check("commit-обёртка честно сообщает об отсутствии токена Bot API",
+          rc == 1 and "TELEGRAM_BOT_TOKEN" in err, (err or out).strip()[:160])
     check("commit пишет снимок", os.path.exists(os.path.join(state, "token_cost_snapshots.json")))
     if os.path.exists(db):
         con = sqlite3.connect(db)
@@ -206,10 +218,11 @@ def main():
     after = con.execute("SELECT COUNT(*) FROM increments WHERE attribution='anomaly'").fetchone()[0]
     con.close()
     check("исчезнувшая строка записана как anomaly", after > before, f"{before} -> {after}")
-    check("anomaly показана в отчёте", "Anomaly-строки" in out)
+    check("anomaly показана в логе, а не в сообщении", "Anomaly-строки" in err and "Anomaly-строки" not in out)
     check("блок плана z.ai в отчёте на чистой копии", "Эквивалентный кодовый план z.ai" in out,
           "строка 'использовано X% Y плана' не печатается")
-    check("блок плана называет, что месячный лимит выведен", "только 5-часовой и недельный" in out, out[-400:])
+    check("блок плана называет, что месячный лимит выведен (в логе)",
+          "только 5-часовой и недельный" in err and "Месячный лимит" not in out, err[:200])
 
     # 10. переполнение Max — частный случай: включается расчёт токенов
     #     и показывает только число переполнения, а не общее количество
@@ -232,18 +245,23 @@ def main():
     check("переполнение Max даёт сообщение о переходе",
           "План Max переполнен, переходим на пересчет токенов." in out, out[:200])
     check("частный случай: расчёт токенов включён",
-          "Пересчёт токенов — только переполнение Max" in out, out[:200])
-    tail = out.split("Пересчёт токенов", 1)[-1]
+          "Сравнительная цена токенов" in out, out[:200])
+    tail = out.split("переполнение Max", 1)[-1]
     check("показывается только переполнение, не общее количество токенов",
           "7000.00M" not in tail, tail[:160])
-    check("z.ai разделён на план и оплату", "оплаченные" in tail, tail[:160])
+    check("z.ai разделён на план и оплату", "оплаченные" in out, out[:200])
+    check("частный случай сохраняет прежнюю форму: пометка про базу и курс",
+          "Суточное окно" in out and "курс взят из «Плати по миру»" in out, out[-200:])
+    check("оговорки блока плана не входят в доставляемое сообщение",
+          "Месячный лимит" not in out and "MCP-вызовы" not in out, out[:200])
 
     # 11. тесты навыка на чистой копии
     for tf in ("test_plan_core.py", "test_plan_usage.py", "test_token_cost.py", "test_single_message.py"):
         r = subprocess.run([PY, os.path.join(skill, "tests", tf)],
                            capture_output=True, text=True, env={**os.environ, "HOME": HOME}, timeout=300)
         check(f"тесты навыка на чистой копии ({tf})", r.returncode == 0,
-              (r.stderr.strip().splitlines() or [""])[-1][:120])
+              " | ".join(l for l in r.stderr.strip().splitlines()
+                         if l.startswith("FAIL:") or l.startswith("ERROR:") or l.startswith("AssertionError"))[:200])
 
     print("\n=== отчёт ===")
     passed = sum(1 for _, ok, _ in RESULTS if ok)
