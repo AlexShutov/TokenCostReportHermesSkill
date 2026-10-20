@@ -109,6 +109,14 @@ def main():
         saved = json.load(f)
     check("setup.sh отвергает некорректный день и оставляет значение по умолчанию",
           "не понял" in out and saved["anchor_date"] != "abc", out[:160])
+    # баг был: повторный запуск установки безусловно писал файл — живой навык терял
+    # сохранённый день якоря (и план), потому что состояние перезаписывалось всегда
+    rc, out, err = run(os.path.join(skill, "scripts", "setup.sh"), "15")
+    with open(os.path.join(state, "token_cost_plan.json"), encoding="utf-8") as f:
+        again = json.load(f)
+    check("setup.sh при повторном запуске сохраняет уже записанный день якоря",
+          again["anchor_date"] == saved["anchor_date"] and "не перезаписываю" in out,
+          out[:160])
     check("setup.sh создаёт state/", os.path.isdir(state))
     # доставка одного сообщения: файл обязан быть в репо — SKILL.md ссылается на
     # него как на шаг доставки, и на машине коллеги без него шаг не работает

@@ -62,6 +62,19 @@ state = os.path.expanduser("~/.hermes/state")
 os.makedirs(state, exist_ok=True)
 path = os.path.join(state, "token_cost_plan.json")
 yesterday = (date.today() - timedelta(days=1)).isoformat()
+# Баг был: повторный запуск установки молча перезаписывал состояние — живой навык
+# терял сохранённый день якоря и план, потому что файл писался безусловно
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            existing = json.load(f)
+    except Exception:
+        existing = {}
+    if existing.get("anchor_date"):
+        print("состояние плана уже есть — не перезаписываю:", path,
+              "->", existing["anchor_date"],
+              "(день меняется так: python3 ~/.hermes/scripts/plan_usage.py --set-anchor <день или YYYY-MM-DD>)")
+        sys.exit(0)
 print("День начала отсчёта месячного плана z.ai: число 1-31 или дата YYYY-MM-DD.")
 print("По умолчанию — вчера (%s): так все данные, уже имеющиеся в базе, попадают в расчёт." % yesterday)
 raw = sys.argv[2].strip()
