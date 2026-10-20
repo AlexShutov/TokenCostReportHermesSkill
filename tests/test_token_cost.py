@@ -297,6 +297,30 @@ class Report(Case):
         """Одна строка с окном, попадающим в текущее месячное окно, и якорь = сегодня."""
         self.seed_row(tokens, model, plan_class)
 
+    def test_base_note_is_delivered(self):
+        """Standing format требует пометку про базу — раньше она собиралась и никогда
+        не печаталась: правила про anomaly и выбрасываемые интервалы не доходили
+        до пользователя."""
+        self.seed_window()
+        out = self.capture([])
+        self.assertIn("Суточное окно = сумма инкрементов", out, out[:400])
+
+    def test_dropped_intervals_are_named_in_the_report(self):
+        self.seed_row(tokens=5000000, attribution="gap", note="интервал 2400 с")
+        out = self.capture([])
+        self.assertIn("Выбрасываемые интервалы", out, out[:400])
+        self.assertIn("TOKEN_COST_MAX_WINDOW", out, out[:400])
+
+    def test_no_dropped_interval_line_when_there_are_none(self):
+        self.seed_row(tokens=1000000, attribution="delta")
+        out = self.capture([])
+        self.assertNotIn("Выбрасываемые интервалы", out, out[:400])
+
+    def test_dropped_interval_not_counted_in_plan_credits(self):
+        self.seed_row(tokens=5000000, attribution="gap", note="интервал 2400 с")
+        out = self.capture([])
+        self.assertIn("Строк плана в окне нет", out, out[:400])
+
     def test_shape_plan_first(self):
         self.seed_window()
         out = self.capture([])

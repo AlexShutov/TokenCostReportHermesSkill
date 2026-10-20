@@ -22,6 +22,7 @@ import json, os, re, sqlite3, sys, time, urllib.request
 from datetime import datetime, timezone
 
 import token_cost_db as T          # append-only база: runs / usage_snapshot / increments
+import attributions as A           # одни общие определения атрибуций (база, ядро плана, отчёт)
 
 CHAT_ID = os.environ.get("TOKEN_COST_CHAT_ID") or "362122320"
 DB = os.path.expanduser("~/.hermes/state.db")
@@ -393,6 +394,12 @@ def main():
         n_anom = con_db.execute("SELECT COUNT(*) FROM increments WHERE attribution='anomaly'").fetchone()[0]
         if n_anom:
             notes.append(f"Anomaly-строки: {n_anom} (уменьшение или исчезновение строки — в суммы не входят).")
+        g = T.gap_tokens(con_db)
+        if g[0]:
+            notes.append(f"Выбрасываемые интервалы: {g[0]} ({sum(g[1:])/1e6:.2f}M токенов) — длиннее порога "
+                         f"{A.MAX_WINDOW_SECONDS // 60} мин (крон не сработал, машина спала, агент завис): "
+                         f"токены реальны, но время за них не атрибутируется, поэтому в суммы они не входят; "
+                         f"порог — переменная TOKEN_COST_MAX_WINDOW.")
         n_unknown = con_db.execute("SELECT COUNT(*) FROM increments WHERE plan_class='unknown'").fetchone()[0]
         if n_unknown:
             notes.append(f"Строки с незаписанным провайдером (plan unknown): {n_unknown} — в суточное окно не входят.")
@@ -498,6 +505,11 @@ def main():
         lines += ["", note]
     if rate_note:
         lines += ["", rate_note]
+    if db_note:
+        # Standing format требует пометку про базу: раньше она собиралась в notes,
+        # но никогда не печаталась, и правила про anomaly/выбрасываемые интервалы
+        # молча не доходили до пользователя
+        lines += ["", db_note]
     lines += ["", "курс взят из «Плати по миру»"]
     print("\n".join(lines))
 
