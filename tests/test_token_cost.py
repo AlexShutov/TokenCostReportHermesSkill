@@ -462,6 +462,21 @@ class Report(Case):
         self.assertEqual(net, ["prices", "rate"],
                          f"запуск 21:00 обязан обновить цены и курс: {net}")
 
+    def test_dry_run_does_not_touch_the_network(self):
+        """Баг был: dry-run тоже ходил на сайт за ценами и курсом (замер 3.184 с) —
+        сеть трогается только на запланированном запуске 21:00. Тест считает фактические
+        обращения: dry-run обязан быть offline и ничего не писать."""
+        net = []
+        self.C.conn = lambda: fake_source(self.ROWS)
+        self.T.src_connect = lambda: fake_source(self.ROWS)
+        self.C.resolve_session = lambda c: "s1"
+        self.C.fetch_prices = lambda: (net.append("prices"), (None, "тест без сети"))[1]
+        self.C.fetch_rate = lambda: (net.append("rate"), (None, "тест без сети"))[1]
+        sys.argv = ["token_cost.py", "--commit", "--dry-run"]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.C.main()
+        self.assertEqual(net, [], f"dry-run обратился к сети: {net}")
+
     def test_tick_does_not_touch_the_network(self):
         net = []
         self.C.conn = lambda: fake_source(self.ROWS)

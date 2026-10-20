@@ -314,7 +314,7 @@ def main():
     # на ручной запуск — это не «доля секунды», которую требует правило)
     note = None
     price_source = "default"
-    if commit:
+    if commit and not dry:
         live, err = fetch_prices()
         if live:
             p = live
@@ -335,8 +335,9 @@ def main():
 
     rate_note = None
     rate_source = "default"
-    if commit:
-        # курс обновляется только на автоматическом запуске по расписанию
+    if commit and not dry:
+        # курс обновляется только на автоматическом запуске по расписанию; dry-run
+        # обязан оставаться offline — иначе тестовый прогон ходит на сайт (замер: 3.184 с)
         rate, rate_err = fetch_rate()
         if rate:
             rate_source = "live"
