@@ -31,7 +31,8 @@ def chat_id():
 
 def run(transport=None, dry=False):
     """Расчёт + отправка одним скриптом. transport — подменяемая отправка (mock в тесте):
-    без неё это сетевой путь, который нельзя проверить offline."""
+    без неё это сетевой путь, который нельзя проверить offline. --dry-run проверяется
+    здесь же: живой прогон без отправки возможен только если флаг читает сам скрипт."""
     os.environ.setdefault("TOKEN_COST_CRON_JOB", "token-cost-daily")
     sys.argv = ["token_cost.py", "--commit"]
     text = C.main()
@@ -45,9 +46,12 @@ if __name__ == "__main__":
     if not r.get("ok"):
         print("ОШКА: %s" % r.get("error"), file=sys.stderr)
         sys.exit(1)
+    # stdout остаётся пустым: крон-задача без агента доставляет stdout как есть,
+    # а сообщение уже отправлено через Bot API — второй копии быть не должно.
+    # Отчёт о доставке — это лог (stderr).
     if r.get("dry"):
         print("dry-run: частей %d (максимум %d символов), удалил бы: %s"
-              % (r["sent"], max(len(p) for p in r["parts"]), r["would_delete"]))
+              % (r["sent"], max(len(p) for p in r["parts"]), r["would_delete"]), file=sys.stderr)
     elif r.get("sent"):
         print("sent %s (частей: %d), удалено старых: %d"
-              % (r.get("message_id"), r["sent"], r.get("deleted", 0)))
+              % (r.get("message_id"), r["sent"], r.get("deleted", 0)), file=sys.stderr)

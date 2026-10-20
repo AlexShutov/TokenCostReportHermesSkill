@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import io
 import unittest
 
 BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
@@ -200,6 +201,17 @@ class Delivery(Case):
         W.run(transport=self.transport)
         self.assertEqual(self.calls[1][1]["chat_id"], "362122320",
                          "без переменной должен оставаться чат автора")
+
+    def test_stdout_stays_empty_so_cron_does_not_post_a_second_copy(self):
+        """Задача без агента доставляет stdout как есть: сообщение уже отправлено
+        через Bot API, поэтому отчёт о доставке пишется в лог, а не в stdout."""
+        import contextlib
+        import token_cost_commit as W
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            W.run(transport=self.transport)
+        self.assertEqual(buf.getvalue(), "",
+                         f"stdout не пуст — cron опубликует вторую копию: {buf.getvalue()!r}")
 
     def test_long_message_is_split_before_sending(self):
         """Ветка переполнения Max — сообщение длинное: деление происходит до отправки."""
