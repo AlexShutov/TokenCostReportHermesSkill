@@ -23,6 +23,22 @@ echo "переменная TOKEN_COST_CHAT_ID — твой Telegram chat id (б�
 echo "может относиться к чату автора навыка)."
 echo "Скрипты должны лежать в ~/.hermes/scripts/ (крон исполняет только оттуда)."
 
+# Плагин-команда /token-cost-daily: запуск отчёта сразу, без LLM. Ставится отдельно
+# от скриптов — гейтвей загружает плагины при старте, и они opt-in через plugins.enabled
+PLUGIN_DIR="$HOME/.hermes/plugins/token-cost-daily"
+if [ -d "$SKILL_DIR/plugin" ]; then
+  mkdir -p "$PLUGIN_DIR"
+  for f in plugin.yaml __init__.py; do
+    if [ -f "$PLUGIN_DIR/$f" ] && ! cmp -s "$SKILL_DIR/plugin/$f" "$PLUGIN_DIR/$f"; then
+      echo "ВНИМАНИЕ: $PLUGIN_DIR/$f уже существует и отличается от версии навыка — не перезаписываю."
+    else
+      cp "$SKILL_DIR/plugin/$f" "$PLUGIN_DIR/$f"
+    fi
+  done
+  echo "Плагин скопирован в $PLUGIN_DIR — включается так: hermes plugins enable token-cost-daily"
+  echo "  (обработчик возвращает None: сообщение отправляет скрипт одним сообщением, второй копии нет)"
+fi
+
 # M3: существующие скрипты не перезаписываются молча — крон исполняет именно
 # копию в ~/.hermes/scripts/, и тихая перезапись меняет поведение живого крона
 TARGET_DIR="$HOME/.hermes/scripts"

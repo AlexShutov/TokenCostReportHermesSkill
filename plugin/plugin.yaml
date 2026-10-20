@@ -1,0 +1,8 @@
+name: token-cost-daily
+version: 1.0.0
+description: "Slash command /token-cost-daily — runs the token-cost report immediately through the Python script, without any LLM call, and delivers exactly one message (the previous tracked message is deleted)."
+author: Hermes Agent
+kind: standalone
+provides_hooks: []
+provides_commands:
+  - token-cost-daily
