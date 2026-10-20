@@ -475,25 +475,32 @@ def resolve_anchor(state, today, default_day=None):
     """
     raw = state.get("anchor_date") or state.get("anchor_day")
     if raw:
-        return parse_anchor(raw), "saved"
+        return parse_anchor(raw, today), "saved"
     if default_day is not None:
         day = min(int(default_day), calendar.monthrange(today.year, today.month)[1])
         return date(today.year, today.month, day), "default_derived"
     return date(today.year, today.month, 1), "default"
 
 
-def parse_anchor(value):
-    """Число 1-31 или дата YYYY-MM-DD -> date (день начала отсчёта месяца)."""
+def parse_anchor(value, today=None):
+    """Число 1-31 или дата YYYY-MM-DD -> date (день начала отсчёта месяца).
+
+    `today` — опорная дата для числового дня: без неё берётся фактическое
+    сегодня, и `--month` с сохранённым числом даёт окно не того месяца (баг K1).
+    """
     if isinstance(value, (date, datetime)):
         return value if isinstance(value, date) else value.date()
     v = str(value).strip()
     if len(v) == 10 and v[4] == "-" and v[7] == "-":
-        return datetime.strptime(v, "%Y-%m-%d").date()
+        y, m, d = int(v[:4]), int(v[5:7]), int(v[8:10])
+        if not 1 <= m <= 12:
+            raise ValueError("месяц начала отсчёта — 1-12")
+        return date(y, m, min(d, calendar.monthrange(y, m)[1]))
     d = int(v)
     if not 1 <= d <= 31:
         raise ValueError("день начала отсчёта — число 1-31 или дата YYYY-MM-DD")
-    today = datetime.now(PEAK_TZ).date()
-    return date(today.year, today.month, min(d, calendar.monthrange(today.year, today.month)[1]))
+    ref = today or datetime.now(PEAK_TZ).date()
+    return date(ref.year, ref.month, min(d, calendar.monthrange(ref.year, ref.month)[1]))
 
 
 # --- переход плана -------------------------------------------------------------

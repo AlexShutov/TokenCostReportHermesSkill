@@ -448,6 +448,16 @@ class ParseAnchorBranches(unittest.TestCase):
     def test_date_object_passes_through(self):
         self.assertEqual(P.parse_anchor(date(2026, 10, 19)), date(2026, 10, 19))
 
+    def test_numeric_anchor_uses_the_reference_month(self):
+        """Баг K1: без опорной даты числовой якорь берётся из фактического сегодня,
+        и --month даёт окно другого месяца."""
+        d, src = P.resolve_anchor({"anchor_day": "31"}, date(2026, 2, 10), None)
+        self.assertEqual(d, date(2026, 2, 28), f"якорь взят из фактического сегодня: {d}")
+        self.assertEqual(src, "saved")
+
+    def test_full_date_with_day_missing_in_that_month_is_clamped(self):
+        self.assertEqual(P.parse_anchor("2026-02-31", date(2026, 2, 10)), date(2026, 2, 28))
+
 
 # --- переход плана -------------------------------------------------------------
 class TransitionNotifierBranches(unittest.TestCase):
