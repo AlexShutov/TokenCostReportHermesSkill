@@ -732,11 +732,6 @@ class PlanReport:
                              "выход %.2fM x %.1f)" % (credits, tot["input"] / 1e6, m["input"],
                                                        tot["cached"] / 1e6, m["cached"],
                                                        tot["output"] / 1e6, m["output"]))
-            n_zai, ztok = self.source.logged_zai(self.window) if self.source is not None else (0, 0)
-            if n_zai:
-                lines.append("Статистика считает только локальные токены; z.ai-строки в окне: %d "
-                             "(%.2fM токенов) — они логируются в базе, но в статистику не входят"
-                             % (n_zai, ztok / 1e6))
             paid = self.paid_rows(rows)
             if paid:
                 ptok = sum(sum(r["tokens"].values()) for r in paid)
@@ -748,6 +743,14 @@ class PlanReport:
         else:
             lines.append("Локальных строк в окне нет — кредиты не считались (статистику считают "
                          "только локальные токены)")
+        # строка лога про z.ai обязана печататься и когда локальных строк нет:
+        # раньше она стояла внутри ветки `if rows:` и молчала именно в том случае,
+        # где пользователю важнее всего видеть, что z.ai-токены не вошли
+        n_zai, ztok = self.source.logged_zai(self.window) if self.source is not None else (0, 0)
+        if n_zai:
+            lines.append("Статистика считает только локальные токены; z.ai-строки в окне: %d "
+                         "(%.2fM токенов) — они логируются в базе, но в статистику не входят"
+                         % (n_zai, ztok / 1e6))
         lines.append("Месячный лимит выведен из недельного: %d x (%d/7) — на сайте публикуется "
                      "только 5-часовой и недельный, месячного нет"
                      % (self.registry.weekly(self.cascade.current_plan(credits) or MAX_PLAN),
