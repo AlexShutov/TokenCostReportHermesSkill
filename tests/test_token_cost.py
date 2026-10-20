@@ -324,7 +324,8 @@ class Report(Case):
         self.seed_row(tokens=400000000)
         out1 = self.capture([])
         self.assertIn("Превышен план Light, перешли на Pro", out1, out1)
-        st = json.load(open(os.path.join(self.T.STATE, "token_cost_plan.json")))
+        with open(os.path.join(self.T.STATE, "token_cost_plan.json"), encoding="utf-8") as f:
+            st = json.load(f)
         self.assertEqual(st.get("plan"), "pro", f"состояние плана не обновлено: {st}")
         out2 = self.capture([])
         self.assertNotIn("Превышен план", out2,
@@ -453,7 +454,7 @@ class Guards(unittest.TestCase):
                     for n, line in enumerate(f, 1):
                         if re.search(r"\bopen\(", line) and "with open" not in line:
                             bad.append("%s:%d %s" % (name, n, line.strip()[:80]))
-        self.assertFalse(bad, "незакрытый open(): " + "; ".join(bad))
+        self.assertFalse(bad, "файл читается без закрытия: " + "; ".join(bad))
 
     def test_no_latin_letters_inside_cyrillic_words(self):
         """Homoglyph не даёт синтаксической ошибки и не ловится тестом — слово
