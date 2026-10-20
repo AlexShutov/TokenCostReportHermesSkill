@@ -52,8 +52,6 @@ if [ "$ANSWER" = "--force" ]; then
   ANSWER=""
 fi
 if [ -z "$ANSWER" ] && [ -t 0 ]; then
-  printf 'День начала отсчёта месячного плана z.ai: число 1-31 или дата YYYY-MM-DD.\n'
-  printf 'Enter — вчера (%s): так все данные, уже имеющиеся в базе, попадают в расчёт.\n' "$(date -v-1d +%Y-%m-%d 2>/dev/null || date -d yesterday +%Y-%m-%d)"
   read -r ANSWER
 fi
 "$PY" - "$SKILL_DIR" "$ANSWER" <<'EOF'
@@ -64,6 +62,8 @@ state = os.path.expanduser("~/.hermes/state")
 os.makedirs(state, exist_ok=True)
 path = os.path.join(state, "token_cost_plan.json")
 yesterday = (date.today() - timedelta(days=1)).isoformat()
+print("День начала отсчёта месячного плана z.ai: число 1-31 или дата YYYY-MM-DD.")
+print("По умолчанию — вчера (%s): так все данные, уже имеющиеся в базе, попадают в расчёт." % yesterday)
 raw = sys.argv[2].strip()
 value = yesterday
 if raw:
