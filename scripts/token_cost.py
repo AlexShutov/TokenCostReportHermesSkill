@@ -42,6 +42,16 @@ KEYS = ("input", "cache", "output")
 ZAI_WHERE = "(billing_provider='zai' OR billing_base_url LIKE '%api.z.ai%')"
 
 
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+
+
 def conn():
     return sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
 
@@ -92,7 +102,7 @@ def resolve_profile():
     job = os.environ.get("TOKEN_COST_CRON_JOB")
     if job:
         try:
-            d = json.load(open(os.path.expanduser("~/.hermes/cron/jobs.json")))
+            d = read_json(os.path.expanduser("~/.hermes/cron/jobs.json"))
             jobs = d if isinstance(d, list) else (d.get("jobs") or [])
             for j in jobs:
                 if isinstance(j, dict) and j.get("name") == job:
@@ -168,7 +178,7 @@ def fetch_prices():
 
 def load_cache():
     try:
-        d = json.load(open(PRICE_CACHE))
+        d = read_json(PRICE_CACHE)
         pk = ("input", "cached", "output")          # ключи цен, не путать с KEYS (ключи токенов)
         return {k: float(v) for k, v in d.items() if k in pk} or None
     except Exception:
@@ -204,7 +214,7 @@ def fetch_rate():
 
 def load_rate_cache():
     try:
-        d = json.load(open(RATE_CACHE))
+        d = read_json(RATE_CACHE)
         v = d.get("rate")
         return float(v) if v else None
     except Exception:
@@ -294,7 +304,7 @@ def main():
     snap = {}
     if os.path.exists(SNAP):
         try:
-            snap = json.load(open(SNAP))      # база суточной дельты = значения копилки на 21:00
+            snap = read_json(SNAP)      # база суточной дельты = значения копилки на 21:00
         except Exception:
             snap = {}
 
@@ -306,8 +316,8 @@ def main():
         price_source = "live"
         try:
             os.makedirs(os.path.dirname(PRICE_CACHE), exist_ok=True)
-            json.dump({"model": LABEL, **p, "fetched_at": datetime.now(timezone.utc).isoformat()},
-                      open(PRICE_CACHE, "w"), ensure_ascii=False)
+            write_json(PRICE_CACHE, {"model": LABEL, **p,
+                                     "fetched_at": datetime.now(timezone.utc).isoformat()})
         except Exception:
             pass
     else:
@@ -324,9 +334,8 @@ def main():
             rate_source = "live"
             try:
                 os.makedirs(os.path.dirname(RATE_CACHE), exist_ok=True)
-                json.dump({"tariff": TARIFF, "rate": rate,
-                           "fetched_at": datetime.now(timezone.utc).isoformat()},
-                          open(RATE_CACHE, "w"), ensure_ascii=False)
+                write_json(RATE_CACHE, {"tariff": TARIFF, "rate": rate,
+                                         "fetched_at": datetime.now(timezone.utc).isoformat()})
             except Exception:
                 pass
         else:
@@ -495,9 +504,8 @@ def main():
     if not dry and commit:
         # база суточного окна = значения копилки на этот запуск в 21:00
         os.makedirs(os.path.dirname(SNAP), exist_ok=True)
-        json.dump({"cumulative": dict(zip(KEYS, cumulative)),
-                   "prices": p, "saved_at": datetime.now(timezone.utc).isoformat()},
-                  open(SNAP, "w"), ensure_ascii=False)
+        write_json(SNAP, {"cumulative": dict(zip(KEYS, cumulative)),
+                          "prices": p, "saved_at": datetime.now(timezone.utc).isoformat()})
     elif not dry:
         # ручной запуск тоже мог пополнить копилку — снимок не трогаем, но помечаем
         pass

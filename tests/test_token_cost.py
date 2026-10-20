@@ -11,6 +11,7 @@ from fractions import Fraction
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -422,6 +423,36 @@ class Parsers(Case):
         self.assertEqual(self.C.parse_price("Free"), 0.0)
         self.assertEqual(self.C.parse_price("-"), None)
         self.assertEqual(self.C.parse_price("$0.15"), 0.15)
+
+
+class Guards(unittest.TestCase):
+    """Минорные правила, которые кодом не реализованы: закрытый файл и homoglyph."""
+
+    skill = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+
+    def test_scripts_read_files_with_context_manager(self):
+        bad = []
+        for name in sorted(os.listdir(self.skill)):
+            if not name.endswith(".py"):
+                continue
+            for n, line in enumerate(open(os.path.join(self.skill, name), encoding="utf-8"), 1):
+                if re.search(r"\bopen\(", line) and "with open" not in line:
+                    bad.append("%s:%d %s" % (name, n, line.strip()[:80]))
+        self.assertFalse(bad, "незакрытый open(): " + "; ".join(bad))
+
+    def test_no_latin_letters_inside_cyrillic_words(self):
+        """Homoglyph не даёт синтаксической ошибки и не ловится тестом — слово
+        просто никогда не совпадёт (правило навыка)."""
+        pat = re.compile(r"[а-яё]+[a-z]+|[a-z]+[а-яё]+")
+        bad = []
+        for name in sorted(os.listdir(self.skill)):
+            if not name.endswith(".py"):
+                continue
+            for n, line in enumerate(open(os.path.join(self.skill, name), encoding="utf-8"), 1):
+                for m in pat.findall(line):
+                    if re.search(r"[а-яё]", m) and re.search(r"[a-z]", m):
+                        bad.append("%s:%d %s" % (name, n, m))
+        self.assertFalse(bad, "homoglyph: " + "; ".join(bad))
 
 
 if __name__ == "__main__":
