@@ -520,13 +520,15 @@ def main():
     if extra:
         print("\n".join(extra), file=sys.stderr)
 
-    return "\n".join(delivered)
-
+    # снимок 21:00 пишет только --commit; ручной запуск копилку пополняет, но
+    # снимок не двигает. Этот блок обязан стоять ДО return: прежняя версия стояла
+    # после него, и --commit никогда не писал снимок (мёртвый код).
     if not dry and commit:
-        # база суточного окна = значения копилки на этот запуск в 21:00
         os.makedirs(os.path.dirname(SNAP), exist_ok=True)
         write_json(SNAP, {"cumulative": dict(zip(KEYS, cumulative)),
                           "prices": p, "saved_at": datetime.now(timezone.utc).isoformat()})
+
+    return "\n".join(delivered)
 
 
 if __name__ == "__main__":

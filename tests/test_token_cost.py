@@ -440,6 +440,27 @@ class Report(Case):
         self.assertEqual(len(out.splitlines()), 2, f"сообщение без базы не вышло: {out!r}")
         self.assertIn("database is locked", log, f"деградация базы не названа в логе: {log!r}")
 
+    def test_commit_writes_snapshot(self):
+        """Баг был: блок записи снимка стоял после return в main() — --commit никогда
+        не писал файл снимка, и суточная дельта по старому пути не считалась никогда."""
+        out, log = self.capture(["--commit"])
+        self.assertTrue(os.path.exists(self.C.SNAP), "--commit не написал снимок")
+        with open(self.C.SNAP, encoding="utf-8") as f:
+            snap = json.load(f)
+        # локальные токены из фейковой source-таблицы (строка qwen/custom)
+        self.assertEqual(snap["cumulative"], dict(zip(self.C.KEYS, (1000, 2000, 300))), snap)
+        self.assertIn("saved_at", snap, snap)
+
+    def test_manual_run_does_not_move_the_snapshot(self):
+        self.capture(["--commit"])
+        with open(self.C.SNAP, encoding="utf-8") as f:
+            before = json.load(f)
+        self.capture([])
+        with open(self.C.SNAP, encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertEqual(before["saved_at"], after["saved_at"],
+                         "ручной запуск сдвинул базу суточного окна")
+
     def test_fresh_install_creates_state_dir(self):
         out, log = self.capture([])
         self.assertEqual(len(out.splitlines()), 2, out)
