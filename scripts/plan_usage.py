@@ -43,6 +43,15 @@ def ro_connect():
     return sqlite3.connect("file:%s?mode=ro" % T.DB, uri=True, timeout=10)
 
 
+def flag_value(argv, name, usage):
+    """Значение флага обязано быть: без него — usage-сообщение, а не traceback."""
+    i = argv.index(name)
+    if i + 1 >= len(argv):
+        print(usage, file=sys.stderr)
+        return None
+    return argv[i + 1]
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     dry = "--dry-run" in argv
@@ -50,10 +59,24 @@ def main(argv=None):
     state = store.load()
     ref = dt.datetime.now(PEAK_TZ)
     if "--month" in argv:
-        ref = dt.datetime.strptime(argv[argv.index("--month") + 1], "%Y-%m").replace(tzinfo=PEAK_TZ)
+        raw = flag_value(argv, "--month", "месяц отсчёта: YYYY-MM")
+        if raw is None:
+            return 2
+        try:
+            ref = dt.datetime.strptime(raw, "%Y-%m").replace(tzinfo=PEAK_TZ)
+        except ValueError:
+            print("месяц отсчёта: YYYY-MM", file=sys.stderr)
+            return 2
 
     if "--set-anchor" in argv:
-        anchor = P.parse_anchor(argv[argv.index("--set-anchor") + 1])
+        raw = flag_value(argv, "--set-anchor", "день начала отсчёта — число 1-31 или дата YYYY-MM-DD")
+        if raw is None:
+            return 2
+        try:
+            anchor = P.parse_anchor(raw, ref.date())
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
         state["anchor_date"] = anchor.isoformat()
         state["anchor_source"] = "saved"
         if not dry:
@@ -61,7 +84,10 @@ def main(argv=None):
         print("день начала отсчёта месяца сохранён: %d (дата якоря %s)" % (anchor.day, anchor.isoformat()))
 
     if "--plan" in argv:
-        plan = argv[argv.index("--plan") + 1].lower()
+        raw = flag_value(argv, "--plan", "план: light | pro | max")
+        if raw is None:
+            return 2
+        plan = raw.lower()
         if not P.PlanRegistry().known(plan):
             print("план: %s" % " | ".join(P.PlanRegistry().order()), file=sys.stderr)
             return 2
@@ -70,7 +96,10 @@ def main(argv=None):
             store.save(state)
 
     if "--model" in argv:
-        model = argv[argv.index("--model") + 1].lower()
+        raw = flag_value(argv, "--model", "модель: " + ", ".join(P.MultiplierRegistry().known_models()))
+        if raw is None:
+            return 2
+        model = raw.lower()
         if not P.MultiplierRegistry().known(model):
             print("модель: %s" % ", ".join(P.MultiplierRegistry().known_models()), file=sys.stderr)
             return 2
@@ -79,7 +108,9 @@ def main(argv=None):
             store.save(state)
 
     by_actual = "--by-actual-model" in argv
-    peak_name = argv[argv.index("--peak") + 1] if "--peak" in argv else "day"
+    peak_name = flag_value(argv, "--peak", "путь пика: day (интегральная оценка по дню) или window (по временному окну)") if "--peak" in argv else "day"
+    if peak_name is None:
+        return 2
     if peak_name not in ("day", "window"):
         print("путь пика: day (интегральная оценка по дню) или window (по временному окну)", file=sys.stderr)
         return 2

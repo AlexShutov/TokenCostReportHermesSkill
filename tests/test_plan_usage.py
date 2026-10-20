@@ -79,6 +79,44 @@ class Case(unittest.TestCase):
             return json.load(f)
 
 
+class FlagBranches(Case):
+    """Каждый флаг обязан выдавать usage-сообщение при отсутствующем или
+    некорректном значении, а не падать с IndexError/ValueError."""
+
+    def capture_both(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.U.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_missing_value_for_each_flag_returns_usage(self):
+        cases = [("--set-anchor", "день начала отсчёта"),
+                 ("--plan", "план"),
+                 ("--model", "модель"),
+                 ("--peak", "путь пика"),
+                 ("--month", "месяц отсчёта")]
+        for flag, expected in cases:
+            code, out, err = self.capture_both([flag])
+            self.assertEqual(code, 2, f"{flag} без значения обязан возвращать 2")
+            self.assertIn(expected, err, f"{flag}: нет usage-сообщения: {err!r}")
+
+    def test_invalid_month_returns_usage_not_valueerror(self):
+        code, out, err = self.capture_both(["--month", "2026-13"])
+        self.assertEqual(code, 2)
+        self.assertIn("месяц отсчёта", err, err)
+
+    def test_invalid_anchor_returns_usage(self):
+        code, out, err = self.capture_both(["--set-anchor", "abc"])
+        self.assertEqual(code, 2)
+        self.assertIn("день начала отсчёта", err, err)
+
+    def test_valid_flags_still_work(self):
+        code, out, err = self.capture_both(["--set-anchor", "13", "--plan", "pro", "--model", "glm-5.3-flash"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("сохранён", out)
+        self.assertEqual(self.state().get("plan"), "pro")
+
+
 # --- только python3 ------------------------------------------------------------
 class Python3Only(Case):
     def test_no_requests_and_shebang_is_python3(self):
