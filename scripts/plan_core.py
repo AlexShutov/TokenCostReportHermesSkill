@@ -59,6 +59,11 @@ PLAN_ORDER = ("light", "pro", "max")
 MAX_PLAN = "max"
 ZAI_PLANS = ("zai_plan", "zai_plan_by_rule", "zai_paid")
 PAID_CLASS = "zai_paid"
+# Правило пользователя: статистику (и процент плана как эквивалент) считает ТОЛЬКО
+# локальные токены — экономия относительно z.ai coding plan. z.ai-строки логируются
+# в базе, но в статистику не входят. Прежний источник брал ZAI_PLANS и считал сами
+# z.ai-токены, что противоречит смыслу навыка.
+STAT_CLASSES = ("local",)
 
 # Дефолт дня начала отсчёта месяца при установке навыка с нуля (запрос пользователя,
 # 2026-10-20): 19-е число — чтобы данные, уже имеющиеся в базе, попали в расчёт.
@@ -231,6 +236,8 @@ class MonthWindow:
 
 # --- источник инкрементов ------------------------------------------------------
 class IncrementSource(ABC):
+    plan_classes = STAT_CLASSES
+
     @abstractmethod
     def rows(self, window) -> List[dict]:
         """Строки окна: dict(session_id, model, plan_class, attribution, window_start,
@@ -239,6 +246,11 @@ class IncrementSource(ABC):
     def anomalies(self, window) -> int:
         """Anomaly-строки окна: они не входят в суммы, но остаются в базе."""
         return 0
+
+    def logged_zai(self, window) -> tuple:
+        """z.ai-строки окна: (число, токены). Они логируются в базе, но в статистику
+        не входят — статистику считают только локальные токены (правило пользователя)."""
+        return (0, 0)
 
     def unknown_count(self, window) -> int:
         """Строки окна с незаписанным провайдером (plan unknown) — в оценку не входят."""
@@ -257,12 +269,20 @@ class IncrementSource(ABC):
 
 
 class InMemoryIncrementSource(IncrementSource):
-    def __init__(self, rows):
+    def __init__(self, rows, plan_classes=None):
         self._rows = list(rows)
+        self.plan_classes = tuple(plan_classes or STAT_CLASSES)
 
     def rows(self, window):
         return [r for r in self._rows if window.contains(r["window_end"])
+                and r["plan_class"] in self.plan_classes
                 and r["attribution"] not in A.EXCLUDED_ATTRIBUTION]
+
+    def logged_zai(self, window):
+        got = [r for r in self._rows if window.contains(r["window_end"])
+               and r["plan_class"] in ZAI_PLANS
+               and r["attribution"] not in A.EXCLUDED_ATTRIBUTION]
+        return (len(got), sum(sum(r["tokens"].values()) for r in got))
 
     def anomalies(self, window):
         return sum(1 for r in self._rows if r["attribution"] == "anomaly"
@@ -289,9 +309,10 @@ class InMemoryIncrementSource(IncrementSource):
 
 
 class SqliteIncrementSource(IncrementSource):
-    def __init__(self, conn_factory, plan_classes=ZAI_PLANS):
+    def __init__(self, conn_factory, plan_classes=None):
         self._conn_factory = conn_factory
-        self._plan_classes = tuple(plan_classes)
+        self._plan_classes = tuple(plan_classes or STAT_CLASSES)
+
 
     def rows(self, window):
         con = self._conn_factory()
@@ -321,6 +342,22 @@ class SqliteIncrementSource(IncrementSource):
                 "SELECT COUNT(*) FROM increments WHERE attribution='anomaly' "
                 "AND window_end>=? AND window_start<=?",
                 (window.start.timestamp(), window.end.timestamp())).fetchone()[0]
+        finally:
+            con.close()
+
+    def logged_zai(self, window):
+        ph = ",".join("?" * len(ZAI_PLANS))
+        con = self._conn_factory()
+        try:
+            # одно определение исключённых атрибуций для обоих путей: иначе путь базы
+            # считал anomaly-строку в logged_zai, а путь ядра — нет, и цифры разошлись
+            row = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(input_delta + cache_delta + output_delta), 0) "
+                "FROM increments WHERE " + A.excluded_sql() + " AND plan_class IN (" + ph + ") "
+                "AND window_end>=? AND window_start<=?",
+                list(A.EXCLUDED_ATTRIBUTION) + list(ZAI_PLANS)
+                + [window.start.timestamp(), window.end.timestamp()]).fetchone()
+            return (row[0], row[1])
         finally:
             con.close()
 
@@ -695,6 +732,11 @@ class PlanReport:
                              "выход %.2fM x %.1f)" % (credits, tot["input"] / 1e6, m["input"],
                                                        tot["cached"] / 1e6, m["cached"],
                                                        tot["output"] / 1e6, m["output"]))
+            n_zai, ztok = self.source.logged_zai(self.window) if self.source is not None else (0, 0)
+            if n_zai:
+                lines.append("Статистика считает только локальные токены; z.ai-строки в окне: %d "
+                             "(%.2fM токенов) — они логируются в базе, но в статистику не входят"
+                             % (n_zai, ztok / 1e6))
             paid = self.paid_rows(rows)
             if paid:
                 ptok = sum(sum(r["tokens"].values()) for r in paid)
@@ -704,7 +746,8 @@ class PlanReport:
                 lines.append("использовано %.1f%% %s плана (%.1f кредитов из месячного лимита %.1f)"
                              % (step.pct, step.plan.capitalize(), step.used, step.cap))
         else:
-            lines.append("Строк плана в окне нет — кредиты не считались")
+            lines.append("Локальных строк в окне нет — кредиты не считались (статистику считают "
+                         "только локальные токены)")
         lines.append("Месячный лимит выведен из недельного: %d x (%d/7) — на сайте публикуется "
                      "только 5-часовой и недельный, месячного нет"
                      % (self.registry.weekly(self.cascade.current_plan(credits) or MAX_PLAN),

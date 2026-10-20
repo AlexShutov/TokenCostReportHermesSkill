@@ -234,10 +234,12 @@ def main():
                 "VALUES('x', ?, 'manual', NULL, 'colleague', 's1', NULL, NULL, '{}', 0, 'default', '{}')",
                 (now,))
     rid = con.execute("SELECT MAX(run_id) FROM runs").fetchone()[0]
+    # переполнение обязан дать ЛОКАЛЬНЫЙ ряд: статистику считают только локальные
+    # токены, z.ai-ряд в счёт не входит (правило пользователя)
     con.execute("INSERT INTO increments(run_id, run_at, run_epoch, window_start, window_end, session_id, "
                 "model, billing_provider, billing_base_url, billing_mode, task, plan_class, input_delta, "
                 "cache_delta, output_delta, attribution, note) VALUES(?, 'x', ?, ?, ?, 's1', "
-                "'glm-5.3-flash', 'zai', 'https://api.z.ai', '', 'chat', 'zai_plan_by_rule', "
+                "'qwen3.8-flash', 'custom', 'http://192.168.1.107:8080', '', 'chat', 'local', "
                 "7000000000, 0, 0, 'delta', '')", (rid, now, now - 100, now))
     con.commit()
     con.close()
@@ -249,7 +251,12 @@ def main():
     tail = out.split("переполнение Max", 1)[-1]
     check("показывается только переполнение, не общее количество токенов",
           "7000.00M" not in tail, tail[:160])
-    check("z.ai разделён на план и оплату", "оплаченные" in out, out[:200])
+    check("z.ai логируется, но не считается в статистике",
+          "Статистика считает только локальные токены" in err and "логируются в базе, но в статистику "
+          "не входят" in err, err[:200])
+    check("z.ai-строки не входят в кредиты статистики",
+          "7000.00M" not in err.split("Кредиты за окно")[0] if "Кредиты за окно" in err else True,
+          "z.ai-ряд попал в кредиты")
     check("частный случай сохраняет прежнюю форму: пометка про базу и курс",
           "Суточное окно" in out and "курс взят из «Плати по миру»" in out, out[-200:])
     check("оговорки блока плана не входят в доставляемое сообщение",

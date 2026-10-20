@@ -34,6 +34,14 @@ def row(model, plan_class, attribution, start, end, i=0, c=0, o=0, session=None)
             "tokens": {"input": i, "cached": c, "output": o}}
 
 
+def fake_db_factory(rows):
+    """Источник закрывает соединение после каждого вызова — тест обязан давать фабрику,
+    иначе второй вызов того же источника падает с 'Cannot operate on a closed database'."""
+    def f():
+        return fake_db(rows)
+    return f
+
+
 def fake_db(rows):
     con = sqlite3.connect(":memory:")
     con.execute("CREATE TABLE increments(" + ", ".join(INC_COLS) + ")")
@@ -206,28 +214,38 @@ class MonthWindowBranches(unittest.TestCase):
 class IncrementSourceBranches(unittest.TestCase):
     def test_inmemory_source_filters_window(self):
         w = P.MonthWindow(date(2026, 10, 19))
-        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11)),
-                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 18, 10), ts(2026, 10, 18, 11))]
+        rows = [row("qwen", "local", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11)),
+                row("qwen", "local", "delta", ts(2026, 10, 18, 10), ts(2026, 10, 18, 11)),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11))]
         got = P.InMemoryIncrementSource(rows).rows(w)
-        self.assertEqual(len(got), 1)
+        self.assertEqual(len(got), 1, "статистику обязана считать только локальная строка окна")
         self.assertEqual(got[0]["window_end"], ts(2026, 10, 20, 11))
+        self.assertEqual(got[0]["plan_class"], "local")
 
-    def test_sqlite_source_excludes_anomaly_and_local(self):
+    def test_sqlite_source_counts_local_and_excludes_zai_and_anomaly(self):
+        """Правило пользователя: статистику (и процент плана как эквивалент) считает
+        только локальный LLM. z.ai-строки логируются в базе, но в статистику не входят.
+        Замер: локальная строка 5000 — единственный результат пути; z.ai-строка 100
+        и anomaly-строка в rows() не попадают, но называются отдельной строкой отчёта."""
         w = P.MonthWindow(date(2026, 10, 19))
         rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 100),
                 row("glm-5.3-flash", "zai_plan_by_rule", "anomaly", ts(2026, 10, 20, 11), ts(2026, 10, 20, 12), -50),
                 row("qwen", "local", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 5000),
                 row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 18, 10), ts(2026, 10, 18, 11), 700)]
-        con = fake_db(rows)
-        src = P.SqliteIncrementSource(lambda: con)
+        src = P.SqliteIncrementSource(fake_db_factory(rows))
         got = src.rows(w)
-        self.assertEqual(len(got), 1)
-        self.assertEqual(got[0]["tokens"]["input"], 100)
+        self.assertEqual(len(got), 1, "путь базы посчитал z.ai вместо локального")
+        self.assertEqual(got[0]["tokens"]["input"], 5000)
+        n, tok = src.logged_zai(w)
+        self.assertEqual(n, 1, "z.ai-строки окна обязаны называться как логгируемые")
+        self.assertEqual(tok, 100)
 
-    def test_sqlite_source_accepts_zai_paid(self):
+    def test_sqlite_source_excludes_zai_paid_from_statistic(self):
         w = P.MonthWindow(date(2026, 10, 19))
-        con = fake_db([row("glm-5.3-flash", "zai_paid", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 10)])
-        self.assertEqual(len(P.SqliteIncrementSource(lambda: con).rows(w)), 1)
+        rows = [row("glm-5.3-flash", "zai_paid", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 10)]
+        src = P.SqliteIncrementSource(fake_db_factory(rows))
+        self.assertEqual(src.rows(w), [], "оплаченные z.ai не входят в статистику")
+        self.assertEqual(src.logged_zai(w)[0], 1, "но они остаются в базе и должны называться")
 
     def test_empty_window_returns_empty(self):
         w = P.MonthWindow(date(2026, 10, 19))
@@ -379,26 +397,24 @@ class SourceBranches(unittest.TestCase):
         """Один контракт для обоих путей источника: раньше in-memory возвращал число,
         путь базы — словарь, и отчёт падал на пути базы (именно он работает на живом
         прогоне). Замер: одинаковые строки — одинаковая форма и одинаковое значение."""
-        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "gap",
+        rows = [row("qwen", "local", "gap",
                     ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 30000, 10000, 10000)]
-        con = fake_db(rows)
         mem = P.InMemoryIncrementSource(rows).gaps(self.window)
-        db = P.SqliteIncrementSource(lambda: con).gaps(self.window)
+        db = P.SqliteIncrementSource(fake_db_factory(rows)).gaps(self.window)
         self.assertIsInstance(db[1], (int, float), "путь базы вернул другую форму")
         self.assertEqual(mem, db, "пути разошлись")
-        con.close()
 
-    def test_local_gap_not_counted_by_db_path(self):
-        """Оценка плана считает только плановые строки: без фильтра по плану в счёт
-        выбрасываемых интервалов попадали локальные. Замер: локальный gap 50000 —
-        путь базы называл его как интервал плана."""
+    def test_local_gap_counted_by_both_paths(self):
+        """Статистику считает только локальный LLM — локальный интервал обязан попадать
+        в счёт обоих путей. Прежнее правило (считать z.ai) отсекало локальный gap:
+        путь базы возвращал ноль, хотя интервал был локальный и реальный."""
         import token_cost_db as T
         rows = [row("qwen", "local", "gap", ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 50000)]
-        con = fake_db(rows)
-        n, tok = P.SqliteIncrementSource(lambda: con).gaps(self.window)
-        self.assertEqual(n, 0, "локальный интервал посчитан как интервал плана")
-        self.assertEqual(tok, 0)
-        con.close()
+        n, tok = P.SqliteIncrementSource(fake_db_factory(rows)).gaps(self.window)
+        self.assertEqual(n, 1, "локальный интервал не посчитан")
+        self.assertEqual(tok, 50000)
+        mem = P.InMemoryIncrementSource(rows).gaps(self.window)
+        self.assertEqual(mem, (n, tok), "пути разошлись на локальном интервале")
 
     def test_single_definition_of_excluded_rows_in_both_paths(self):
         """Одно определение исключённых атрибуций для обоих путей: раньше путь ядра
@@ -407,14 +423,14 @@ class SourceBranches(unittest.TestCase):
         считал. Плюс плейсхолдеры общего условия (2) не совпадали с числом
         аргументов — 7 против 5, ошибка подстановки на живом прогоне."""
         import token_cost_db as T
-        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "gap",
+        rows = [row("qwen", "local", "gap",
                     ts(2026, 10, 20, 10), ts(2026, 10, 20, 15), 50000),
-                row("glm-5.3-flash", "zai_plan_by_rule", "delta",
+                row("qwen", "local", "delta",
                     ts(2026, 10, 20, 15), ts(2026, 10, 20, 16), 10000)]
         con = fake_db(rows)
-        s = T.window_sum(con, "zai_plan_by_rule",
+        s = T.window_sum(con, "local",
                          self.window.start.timestamp(), self.window.end.timestamp())
-        core = P.SqliteIncrementSource(lambda: con).rows(self.window)
+        core = P.SqliteIncrementSource(fake_db_factory(rows)).rows(self.window)
         self.assertEqual(s[0], 10000, "путь базы посчитал выбрасываемый интервал")
         self.assertEqual(sum(r["tokens"]["input"] for r in core), 10000,
                          "путь ядра посчитал выбрасываемый интервал")
@@ -459,27 +475,26 @@ class SourceBranches(unittest.TestCase):
         self.assertEqual(src.anomalies(self.window), 1)
         self.assertEqual(src.unknown_count(self.window), 1)
 
-    def test_paid_rows_excluded_from_plan_credits(self):
-        """Баг M1: оплаченные z.ai (реально списанные деньги) не план — они не должны
-        входить в кредиты плана, но обязаны называться отдельной строкой блока."""
+    def test_zai_rows_logged_but_not_counted(self):
+        """Правило пользователя: смысл навыка — экономия на локальной LLM относительно
+        z.ai coding plan. Статистику считают только локальные токены; z.ai-строки
+        логируются в базе, но в процент не входят. Замер: локальная строка 1M входит,
+        z.ai-строки 2M и 3M — не входят, но названы отдельной строкой отчёта."""
         w = P.MonthWindow(date(2026, 10, 19))
-        rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta",
-                    ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 1000000),
-                row("glm-5.3-flash", "zai_paid", "delta",
-                    ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 2000000)]
+        rows = [row("qwen", "local", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 1000000),
+                row("glm-5.3-flash", "zai_paid", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 2000000),
+                row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 20, 10), ts(2026, 10, 20, 11), 3000000)]
         src = P.InMemoryIncrementSource(rows)
         rep = P.PlanReport(w, P.PlanCascade(P.PlanRegistry(), w), P.StandardCreditCalculator(),
                            P.MultiplierRegistry(), P.PlanRegistry(), P.DayIntegralPeakModel(),
                            state={}, source=src)
         got = rep.rows()
-        self.assertEqual(len(got), 2, "источник обязан отдавать и оплаченные строки")
-        self.assertAlmostEqual(rep.credits(got), 134.17, places=2,
-                               msg="оплаченные строки вошли в кредиты плана")
-        out = rep.build(got, rep.credits(got))
-        self.assertTrue(any("Оплаченные z.ai в окне" in l for l in out),
-                        f"оплаченные не названы отдельной строкой: {out}")
-        self.assertFalse(any("2.00M" in l and "Кредиты за окно" in l for l in out),
-                         f"итог токенов окна включает оплаченные: {out}")
+        self.assertEqual(len(got), 1, "в статистику попала z.ai-строка")
+        self.assertEqual(got[0]["plan_class"], "local")
+        out = "\n".join(rep.build())
+        self.assertIn("только локальные токены", out)
+        self.assertIn("логируются в базе, но в статистику не входят", out)
+        self.assertIn("2 (5.00M токенов)", out)
 
     def test_degraded_when_source_missing(self):
         report = P.PlanReport(self.window, P.PlanCascade(P.PlanRegistry(), self.window),
@@ -597,7 +612,8 @@ class PlanReportBranches(unittest.TestCase):
 
     def test_block_without_rows_says_so(self):
         out = "\n".join(self.report.build())
-        self.assertIn("Строк плана в окне нет", out)
+        self.assertIn("Локальных строк в окне нет", out)
+        self.assertIn("только локальные токены", out)
 
     def test_block_with_rows(self):
         rows = [row("glm-5.3-flash", "zai_plan_by_rule", "delta", ts(2026, 10, 19, 10), ts(2026, 10, 19, 11), 10000)]
