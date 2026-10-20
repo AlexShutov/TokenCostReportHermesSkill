@@ -28,14 +28,21 @@ echo "Скрипты должны лежать в ~/.hermes/scripts/ (крон �
 PLUGIN_DIR="$HOME/.hermes/plugins/token-cost-daily"
 if [ -d "$SKILL_DIR/plugin" ]; then
   mkdir -p "$PLUGIN_DIR"
+  PDIFF=0
   for f in plugin.yaml __init__.py; do
     if [ -f "$PLUGIN_DIR/$f" ] && ! cmp -s "$SKILL_DIR/plugin/$f" "$PLUGIN_DIR/$f"; then
       echo "ВНИМАНИЕ: $PLUGIN_DIR/$f уже существует и отличается от версии навыка — не перезаписываю."
-    else
-      cp "$SKILL_DIR/plugin/$f" "$PLUGIN_DIR/$f"
+      PDIFF=1
     fi
   done
-  echo "Плагин скопирован в $PLUGIN_DIR — включается так: hermes plugins enable token-cost-daily"
+  if [ "$PDIFF" = 1 ] && [ "$FORCE" = 0 ]; then
+    echo "  Перезапись плагина — только осознанно: bash $SKILL_DIR/scripts/setup.sh --force"
+  else
+    for f in plugin.yaml __init__.py; do
+      cp "$SKILL_DIR/plugin/$f" "$PLUGIN_DIR/$f"
+    done
+  fi
+  echo "Плагин в $PLUGIN_DIR — включается так: hermes plugins enable token-cost-daily"
   echo "  (обработчик возвращает None: сообщение отправляет скрипт одним сообщением, второй копии нет)"
 fi
 
