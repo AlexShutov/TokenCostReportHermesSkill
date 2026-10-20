@@ -129,7 +129,13 @@ class Delivery(Case):
         # пути решаются при импорте: без перезагрузки модуль остаётся с HOME предыдущего
         # теста, и патч main() из одного теста утекает в следующий
         importlib.reload(C)
-        self.C = C
+        import token_cost_db as T
+        importlib.reload(T)
+        self.C, self.T = C, T
+        # пути решаются при импорте: без перезагрузки тест читает базу того HOME,
+        # где модуль был импортирован впервые (в прогоне чистой установки это HOME
+        # коллеги с рядами предыдущих проверок — тест ловил переполнение Max,
+        # которого в нём быть не должно)
         C.conn = lambda: self.fake_source()
         C.resolve_session = lambda c: "s1"
         C.fetch_prices = lambda: (None, "тест без сети")
